@@ -9,8 +9,8 @@ import (
 	"errors"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/tsuna/gohbase/filter"
-	"github.com/tsuna/gohbase/internal/pb"
+	"github.com/cannium/gohbase/filter"
+	"github.com/cannium/gohbase/internal/pb"
 	"golang.org/x/net/context"
 )
 

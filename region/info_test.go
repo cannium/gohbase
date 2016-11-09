@@ -11,8 +11,8 @@ import (
 	"testing"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/tsuna/gohbase/hrpc"
-	"github.com/tsuna/gohbase/internal/pb"
+	"github.com/cannium/gohbase/hrpc"
+	"github.com/cannium/gohbase/internal/pb"
 )
 
 // Test parsing the contents of a cell found in meta.

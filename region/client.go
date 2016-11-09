@@ -16,8 +16,8 @@ import (
 	log "github.com/Sirupsen/logrus"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/tsuna/gohbase/hrpc"
-	"github.com/tsuna/gohbase/internal/pb"
+	"github.com/cannium/gohbase/hrpc"
+	"github.com/cannium/gohbase/internal/pb"
 )
 
 // ClientType is a type alias to represent the type of this region client
@@ -285,6 +285,7 @@ func (c *client) receive() error {
 		err = proto.UnmarshalMerge(buf, rpcResp)
 	} else {
 		javaClass := *resp.Exception.ExceptionClassName
+		fmt.Println("HBase Exception: ", javaClass)
 		err = fmt.Errorf("HBase Java exception %s: \n%s", javaClass, *resp.Exception.StackTrace)
 		if _, ok := javaRetryableExceptions[javaClass]; ok {
 			// This is a recoverable error. The client should retry.

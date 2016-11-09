@@ -14,10 +14,10 @@ import (
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/cznic/b"
-	"github.com/tsuna/gohbase/hrpc"
-	"github.com/tsuna/gohbase/internal/pb"
-	"github.com/tsuna/gohbase/internal/zk"
-	"github.com/tsuna/gohbase/region"
+	"github.com/cannium/gohbase/hrpc"
+	"github.com/cannium/gohbase/internal/pb"
+	"github.com/cannium/gohbase/internal/zk"
+	"github.com/cannium/gohbase/region"
 	"golang.org/x/net/context"
 )
 

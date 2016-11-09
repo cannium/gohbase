@@ -11,8 +11,8 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/tsuna/gohbase/hrpc"
-	"github.com/tsuna/gohbase/region"
+	"github.com/cannium/gohbase/hrpc"
+	"github.com/cannium/gohbase/region"
 	"golang.org/x/net/context"
 )
 

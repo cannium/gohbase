@@ -5,7 +5,7 @@ package mock
 
 import (
 	gomock "github.com/golang/mock/gomock"
-	hrpc "github.com/tsuna/gohbase/hrpc"
+	hrpc "github.com/cannium/gohbase/hrpc"
 	context "golang.org/x/net/context"
 )
 

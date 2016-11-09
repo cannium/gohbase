@@ -15,8 +15,8 @@ import (
 
 	"github.com/aristanetworks/goarista/test"
 	"github.com/golang/mock/gomock"
-	"github.com/tsuna/gohbase/hrpc"
-	"github.com/tsuna/gohbase/test/mock"
+	"github.com/cannium/gohbase/hrpc"
+	"github.com/cannium/gohbase/test/mock"
 	"golang.org/x/net/context"
 )
 

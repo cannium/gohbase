@@ -6,8 +6,8 @@
 package mock_test
 
 import (
-	"github.com/tsuna/gohbase"
-	"github.com/tsuna/gohbase/test/mock"
+	"github.com/cannium/gohbase"
+	"github.com/cannium/gohbase/test/mock"
 )
 
 var _ gohbase.Client = (*mock.MockClient)(nil)

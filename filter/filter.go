@@ -9,7 +9,7 @@ import (
 	"errors"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/tsuna/gohbase/internal/pb"
+	"github.com/cannium/gohbase/internal/pb"
 )
 
 const filterPath = "org.apache.hadoop.hbase.filter."

@@ -8,8 +8,8 @@ package gohbase
 import (
 	"fmt"
 
-	"github.com/tsuna/gohbase/hrpc"
-	"github.com/tsuna/gohbase/internal/pb"
+	"github.com/cannium/gohbase/hrpc"
+	"github.com/cannium/gohbase/internal/pb"
 )
 
 // AdminClient to perform admistrative operations with HMaster
