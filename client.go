@@ -137,8 +137,7 @@ func (c *client) Close() {
 // Scan retrieves the values specified in families from the given range.
 func (c *client) Scan(s *hrpc.Scan) ([]*hrpc.Result, error) {
 	var results []*pb.Result
-	var scanres *pb.ScanResponse
-	var rpc *hrpc.Scan
+	var scanResp *pb.ScanResponse
 	ctx := s.Context()
 	table := s.Table()
 	families := s.Families()
@@ -146,22 +145,22 @@ func (c *client) Scan(s *hrpc.Scan) ([]*hrpc.Result, error) {
 	startRow := s.StartRow()
 	stopRow := s.StopRow()
 	fromTs, toTs := s.TimeRange()
-	maxVerions := s.MaxVersions()
+	maxVersions := s.MaxVersions()
 	numberOfRows := s.NumberOfRows()
-	for {
-		// Make a new Scan RPC for this region
-		if rpc != nil {
-			// If it's not the first region, we want to start at whatever the
-			// last region's StopKey was
-			startRow = rpc.RegionStop()
-		}
 
+	var receivedRows uint32
+	for {
+		var rowsToFetch uint32
+		if numberOfRows > 0 {
+			rowsToFetch = numberOfRows - receivedRows
+		}
+		// Make a new Scan RPC for this region
 		// TODO: would be nicer to clone it in some way
 		rpc, err := hrpc.NewScanRange(ctx, table, startRow, stopRow,
 			hrpc.Families(families), hrpc.Filters(filters),
 			hrpc.TimeRangeUint64(fromTs, toTs),
-			hrpc.MaxVersions(maxVerions),
-			hrpc.NumberOfRows(numberOfRows))
+			hrpc.MaxVersions(maxVersions),
+			hrpc.NumberOfRows(rowsToFetch))
 		if err != nil {
 			return nil, err
 		}
@@ -170,29 +169,33 @@ func (c *client) Scan(s *hrpc.Scan) ([]*hrpc.Result, error) {
 		if err != nil {
 			return nil, err
 		}
-		scanres = res.(*pb.ScanResponse)
-		results = append(results, scanres.Results...)
+		scanResp = res.(*pb.ScanResponse)
+		results = append(results, scanResp.Results...)
+		receivedRows += len(scanResp.Results)
 
-		// TODO: The more_results field of the ScanResponse object was always
-		// true, so we should figure out if there's a better way to know when
-		// to move on to the next region than making an extra request and
-		// seeing if there were no results
-		for len(scanres.Results) != 0 {
-			rpc = hrpc.NewScanFromID(ctx, table, *scanres.ScannerId, rpc.Key())
+		for scanResp.GetMoreResultsInRegion() ||
+			(len(scanResp.Results) > 0  && scanResp.GetMoreResults()) {
+
+			rpc = hrpc.NewScanFromID(ctx, table, *scanResp.ScannerId, rpc.Key())
 
 			res, err = c.sendRPC(rpc)
 			if err != nil {
 				return nil, err
 			}
-			scanres = res.(*pb.ScanResponse)
-			results = append(results, scanres.Results...)
+			scanResp = res.(*pb.ScanResponse)
+			results = append(results, scanResp.Results...)
+			receivedRows += len(scanResp.Results)
 		}
 
-		rpc = hrpc.NewCloseFromID(ctx, table, *scanres.ScannerId, rpc.Key())
+		rpc = hrpc.NewCloseFromID(ctx, table, *scanResp.ScannerId, rpc.Key())
 		if err != nil {
 			return nil, err
 		}
 		res, err = c.sendRPC(rpc)
+		// FIXME error would raise if this error is handled
+		// if err != nil {
+		// 	return nil, err
+		// }
 
 		// Check to see if this region is the last we should scan (either
 		// because (1) it's the last region or (3) because its stop_key is
@@ -201,7 +204,9 @@ func (c *client) Scan(s *hrpc.Scan) ([]*hrpc.Result, error) {
 		// (1)
 		if len(rpc.RegionStop()) == 0 ||
 			// (2)                (3)
-			len(stopRow) != 0 && bytes.Compare(stopRow, rpc.RegionStop()) <= 0 {
+			(len(stopRow) != 0 && bytes.Compare(stopRow, rpc.RegionStop()) <= 0) ||
+			(receivedRows != 0 && receivedRows >= numberOfRows) {
+
 			// Do we want to be returning a slice of Result objects or should we just
 			// put all the Cells into the same Result object?
 			localResults := make([]*hrpc.Result, len(results))
@@ -209,6 +214,8 @@ func (c *client) Scan(s *hrpc.Scan) ([]*hrpc.Result, error) {
 				localResults[idx] = hrpc.ToLocalResult(result)
 			}
 			return localResults, nil
+		} else {
+			startRow = rpc.RegionStop()
 		}
 	}
 }
