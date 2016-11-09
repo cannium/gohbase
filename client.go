@@ -41,6 +41,13 @@ type Client interface {
 
 type Option func(*client)
 
+func SetZnodeParentOption(znodeParent string) Option {
+	return func(*client) {
+		zk.Meta = zk.ResourceName(znodeParent + "/meta-region-server")
+		zk.Master = zk.ResourceName(znodeParent + "/master")
+	}
+}
+
 // A Client provides access to an HBase cluster.
 type client struct {
 	clientType int
