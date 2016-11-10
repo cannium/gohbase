@@ -7,16 +7,15 @@ package gohbase
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
-	"log"
 	"time"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/cannium/gohbase/hrpc"
 	"github.com/cannium/gohbase/internal/zk"
 	"github.com/cannium/gohbase/region"
-	"golang.org/x/net/context"
+	"github.com/golang/protobuf/proto"
 )
 
 // Constants
@@ -45,146 +44,98 @@ var (
 	backoffStart = 16 * time.Millisecond
 )
 
-func (c *client) sendRPC(rpc hrpc.Call) (proto.Message, error) {
-	// Check the cache for a region that can handle this request
-	var err error
+func (c *client) findDestinationRegion(rpc hrpc.RpcCall) (*region.Region, error) {
+	if c.clientType == adminClient {
+		return c.ensuredAdminRegion(rpc.Context())
+	} else if bytes.Equal(rpc.Table(), metaTableName) {
+		return c.ensureMetaRegion(rpc.Context())
+	}
 
-	// block in case someone is updating regions.
-	// for example someone is replacing a region with a new one,
-	// we want to wait for that to finish so that we don't do
-	// unnecessary region lookups in case that's our region.
-	// TODO: is this bad?? We will unnecessarily slow down rpcs that have
-	// regions in cache every time we add a new region,
-	// so maybe it's fine to fail and take longer here
-	c.regionsLock.Lock()
-	reg := c.getRegionFromCache(rpc.Table(), rpc.Key())
-	c.regionsLock.Unlock()
-	if reg == nil {
-		reg, err = c.findRegion(rpc.Context(), rpc.Table(), rpc.Key())
+	onUnavailable := func(ctx context.Context) (*region.Region, string, uint16, error) {
+		return c.metaLookup(ctx, rpc.Table(), rpc.Key())
+	}
+
+	return c.regions.get(rpc.Context(), rpc.Table(), rpc.Key(), onUnavailable)
+}
+
+func (c *client) sendRPC(rpc hrpc.RpcCall) (proto.Message, *region.Region, error) {
+	for {
+		r, err := c.findDestinationRegion(rpc)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
+		}
+
+		if !r.Available() {
+			return nil, nil, region.ErrRegionUnavailable
+		}
+
+		rpc.SetRegionName(r.Name())
+		r.Client().QueueRPC(rpc)
+
+		// Wait for the response
+		var result hrpc.RpcResult
+		select {
+		case result = <-rpc.ResultChan():
+		case <-rpc.Context().Done():
+			return nil, nil, ErrDeadline
+		}
+
+		// Check for errors
+		switch result.Error.(type) {
+		case region.RetryableError:
+			// Region is currently unavailable(split, moved, etc),
+			// but our client(connection) is good, mark region as unavailable
+			// and continue for loop
+			markRegionUnavailable(r)
+		case region.UnrecoverableError:
+			// Client is considered dead(connection broken, etc),
+			// mark ALL regions belong to this client as unavailable
+			// and continue for loop
+			r.Client().ClientDown()
+		default:
+			// RPC was successfully sent, or an unknown type of error
+			// occurred. In either case, return the results.
+			return result.Msg, r, result.Error
 		}
 	}
-	return c.sendRPCToRegion(rpc, reg)
 }
 
-func (c *client) sendRPCToRegion(rpc hrpc.Call, reg hrpc.RegionInfo) (proto.Message, error) {
-	// check if the region is marked as available
-	if reg.IsUnavailable() {
-		return c.waitOnRegion(rpc, reg)
+func (c *client) ensureRegionHelper(ctx context.Context, r *region.Region,
+	zookeeperResource zk.ResourceName, clientType region.ClientType) error {
+
+	if r.Available() {
+		return nil
 	}
 
-	rpc.SetRegion(reg)
-
-	// Queue the RPC to be sent to the region
-	var err error
-	if client := reg.Client(); client != nil {
-		err = client.QueueRPC(rpc)
-	} else {
-		err = errors.New("no client for this region")
-	}
+	lookupContext, cancel := context.WithTimeout(ctx, regionLookupTimeout)
+	host, port, err := c.zkLookup(lookupContext, zookeeperResource)
+	cancel()
 	if err != nil {
-		// There was an error queueing the RPC.
-		// Mark the region as unavailable.
-		if reg.MarkUnavailable() {
-			// If this was the first goroutine to mark the region as
-			// unavailable, start a goroutine to reestablish a connection
-			go c.reestablishRegion(reg)
-		}
-		// Block until the region becomes available.
-		return c.waitOnRegion(rpc, reg)
+		return err
 	}
-
-	// Wait for the response
-	var res hrpc.RPCResult
-	select {
-	case res = <-rpc.ResultChan():
-	case <-rpc.Context().Done():
-		return nil, ErrDeadline
+	client, err := region.NewClient(ctx, host, port, clientType,
+		region.QUEUE_SIZE, region.FLUSH_INTERVAL)
+	if err != nil {
+		return err
 	}
-
-	// Check for errors
-	switch res.Error.(type) {
-	case region.RetryableError:
-		// There's an error specific to this region, but
-		// our region client is fine. Mark this region as
-		// unavailable (as opposed to all regions sharing
-		// the client), and start a goroutine to reestablish
-		// it.
-		if reg.MarkUnavailable() {
-			go c.reestablishRegion(reg)
-		}
-		if reg != c.adminRegionInfo {
-			// The client won't be in the clients cache if this is the admin region
-			c.clients.del(reg)
-		}
-		return c.waitOnRegion(rpc, reg)
-	case region.UnrecoverableError:
-		// If it was an unrecoverable error, the region client is
-		// considered dead.
-		if reg == c.adminRegionInfo {
-			// If this is the admin client, mark the region
-			// as unavailable and start up a goroutine to
-			// reconnect if it wasn't already marked as such.
-			if reg.MarkUnavailable() {
-				go c.reestablishRegion(reg)
-			}
-		} else {
-			// Else this is a normal region. Mark all the regions
-			// sharing this region's client as unavailable, and start
-			// a goroutine to reconnect for each of them.
-			downregions := c.clients.clientDown(reg)
-			for _, downreg := range downregions {
-				go c.reestablishRegion(downreg)
-			}
-		}
-
-		// Fall through to the case of the region being unavailable,
-		// which will result in blocking until it's available again.
-		return c.waitOnRegion(rpc, reg)
-	default:
-		// RPC was successfully sent, or an unknown type of error
-		// occurred. In either case, return the results.
-		return res.Msg, res.Error
-	}
+	r.SetClient(client)
+	client.AddRegion(r)
+	return nil
 }
 
-func (c *client) waitOnRegion(rpc hrpc.Call, reg hrpc.RegionInfo) (proto.Message, error) {
-	ch := reg.AvailabilityChan()
-	if ch == nil {
-		// WTF, this region is available? Maybe it was marked as such
-		// since waitOnRegion was called.
-		return c.sendRPC(rpc)
-	}
-	// The region is unavailable. Wait for it to become available,
-	// or for the deadline to be exceeded.
-	select {
-	case <-ch:
-		return c.sendRPC(rpc)
-	case <-rpc.Context().Done():
-		return nil, ErrDeadline
-	}
+func (c *client) ensuredAdminRegion(rootContext context.Context) (*region.Region, error) {
+	err := c.ensureRegionHelper(rootContext, c.adminRegion, zk.Master, region.MasterClient)
+	return c.adminRegion, err
 }
 
-// checkAndPutRegion checks cache for table and key and if no region exists,
-// marks passed region unavailable and adds it to cache.
-// This method is not concurrency safe, requires regionsLock.
-func (c *client) checkAndPutRegion(table, key []byte, region hrpc.RegionInfo) hrpc.RegionInfo {
-	if existing := c.getRegionFromCache(table, key); existing != nil {
-		return existing
-	}
-
-	region.MarkUnavailable()
-	removed := c.regions.put(region)
-	for _, r := range removed {
-		c.clients.del(r)
-	}
-	return region
+func (c *client) ensureMetaRegion(rootContext context.Context) (*region.Region, error) {
+	err := c.ensureRegionHelper(rootContext, c.metaRegion, zk.Meta, region.RegionClient)
+	return c.metaRegion, err
 }
 
 func (c *client) lookupRegion(ctx context.Context,
-	table, key []byte) (hrpc.RegionInfo, string, uint16, error) {
-	var reg hrpc.RegionInfo
+	table, key []byte) (*region.Region, string, uint16, error) {
+	var reg *region.Region
 	var host string
 	var port uint16
 	var err error
@@ -195,11 +146,11 @@ func (c *client) lookupRegion(ctx context.Context,
 		if c.clientType == adminClient {
 			host, port, err = c.zkLookup(lookupCtx, zk.Master)
 			cancel()
-			reg = c.adminRegionInfo
-		} else if bytes.Compare(table, c.metaRegionInfo.Table()) == 0 {
+			reg = c.adminRegion
+		} else if bytes.Compare(table, c.metaRegion.Table()) == 0 {
 			host, port, err = c.zkLookup(lookupCtx, zk.Meta)
 			cancel()
-			reg = c.metaRegionInfo
+			reg = c.metaRegion
 		} else {
 			reg, host, port, err = c.metaLookup(lookupCtx, table, key)
 			cancel()
@@ -218,54 +169,6 @@ func (c *client) lookupRegion(ctx context.Context,
 	}
 }
 
-func (c *client) findRegion(ctx context.Context, table, key []byte) (hrpc.RegionInfo, error) {
-	// The region was not in the cache, it
-	// must be looked up in the meta table
-	reg, host, port, err := c.lookupRegion(ctx, table, key)
-	if err != nil {
-		return nil, err
-	}
-
-	// Check that the region wasn't added to
-	// the cache while we were looking it up.
-	c.regionsLock.Lock()
-	if r := c.checkAndPutRegion(table, key, reg); reg != r {
-		c.regionsLock.Unlock()
-		return r, nil
-	}
-	c.regionsLock.Unlock()
-
-	// Start a goroutine to connect to the region
-	go c.establishRegion(reg, host, port)
-
-	// Wait for the new region to become
-	// available, and then send the RPC
-	return reg, nil
-}
-
-// Searches in the regions cache for the region hosting the given row.
-func (c *client) getRegionFromCache(table, key []byte) hrpc.RegionInfo {
-	if c.clientType == adminClient {
-		return c.adminRegionInfo
-	} else if bytes.Equal(table, metaTableName) {
-		return c.metaRegionInfo
-	}
-	regionName := createRegionSearchKey(table, key)
-	_, region := c.regions.get(regionName)
-	if region == nil || !bytes.Equal(table, region.Table()) {
-		return nil
-	}
-
-	if len(region.StopKey()) != 0 &&
-		// If the stop key is an empty byte array, it means this region is the
-		// last region for this table and this key ought to be in that region.
-		bytes.Compare(key, region.StopKey()) >= 0 {
-		return nil
-	}
-
-	return region
-}
-
 // Creates the META key to search for in order to locate the given key.
 func createRegionSearchKey(table, key []byte) []byte {
 	metaKey := make([]byte, 0, len(table)+len(key)+3)
@@ -282,7 +185,7 @@ func createRegionSearchKey(table, key []byte) []byte {
 
 // metaLookup checks meta table for the region in which the given row key for the given table is.
 func (c *client) metaLookup(ctx context.Context,
-	table, key []byte) (hrpc.RegionInfo, string, uint16, error) {
+	table, key []byte) (*region.Region, string, uint16, error) {
 
 	metaKey := createRegionSearchKey(table, key)
 	rpc, err := hrpc.NewGetBefore(ctx, metaTableName, metaKey, hrpc.Families(infoFamily))
@@ -315,120 +218,22 @@ func (c *client) metaLookup(ctx context.Context,
 	return reg, host, port, nil
 }
 
-func (c *client) reestablishRegion(reg hrpc.RegionInfo) {
-	c.establishRegion(reg, "", 0)
-}
-
-func (c *client) establishRegion(reg hrpc.RegionInfo, host string, port uint16) {
-	backoff := backoffStart
-	var err error
-	for {
-		if host == "" && port == 0 {
-			// need to look up region and address of the regionserver
-			originalReg := reg
-			// lookup region forever until we get it or we learn that it doesn't exist
-			reg, host, port, err = c.lookupRegion(context.Background(),
-				originalReg.Table(), originalReg.StartKey())
-			if err == TableNotFound {
-				// region doesn't exist, delete it from caches
-				c.regions.del(originalReg.Name())
-				c.clients.del(originalReg)
-				originalReg.MarkAvailable()
-				return
-			} else if err != nil {
-				log.Fatalf("Unknow error occured when looking up region: %v", err)
-			}
-
-			if bytes.Compare(reg.Name(), originalReg.Name()) != 0 {
-				// there's a new region, we should remove the old one
-				// and add this one unless someone else has already done so
-				c.regionsLock.Lock()
-				// delete original since we have a new one
-				c.regions.del(originalReg.Name())
-
-				// Check that the region wasn't added to
-				// the cache while we were looking it up.
-				// For example if region merge happened and some dude
-				// was looking up the region before the original and found the
-				// same one as we are and could have added it to the cache
-				if r := c.checkAndPutRegion(reg.Table(), reg.StartKey(), reg); reg != r {
-					// looks like someone already found this region already,
-					// it's their responsibility to reestablish it
-					c.regionsLock.Unlock()
-					// let rpcs know that they can retry
-					originalReg.MarkAvailable()
-					return
-				}
-				c.regionsLock.Unlock()
-
-				// let rpcs know that they can retry and either get the newly
-				// added region from cache or lookup the one they need
-				originalReg.MarkAvailable()
-			} else {
-				// same region, discard the looked up one
-				reg = originalReg
-			}
-		}
-
-		// connect to the region's regionserver
-		if client, err := c.establishRegionClient(reg, host, port); err == nil {
-			// set region client so that as soon as we mark it available,
-			// concurrent readers are able to find the client
-			reg.SetClient(client)
-			if c.clientType != adminClient {
-				c.clients.put(client, reg)
-			}
-			reg.MarkAvailable()
-			return
-		}
-
-		// reset address because we weren't able to connect to it,
-		// should look up again
-		host, port = "", 0
-
-		// This will be hit if there was an error connecting to the region
-		backoff, err = sleepAndIncreaseBackoff(context.Background(), backoff)
-		if err != nil {
-			log.Fatalf("This error should never happen: %v", err)
-		}
+func backoff(t time.Duration) time.Duration {
+	// TODO: Revisit how we back off here.
+	if t < 5000*time.Millisecond {
+		return t * 2
+	} else {
+		return t + 5000*time.Millisecond
 	}
 }
 
-func sleepAndIncreaseBackoff(ctx context.Context, backoff time.Duration) (time.Duration, error) {
+func sleepAndIncreaseBackoff(ctx context.Context, t time.Duration) (time.Duration, error) {
 	select {
-	case <-time.After(backoff):
+	case <-time.After(t):
 	case <-ctx.Done():
 		return 0, ErrDeadline
 	}
-	// TODO: Revisit how we back off here.
-	if backoff < 5000*time.Millisecond {
-		return backoff * 2, nil
-	} else {
-		return backoff + 5000*time.Millisecond, nil
-	}
-}
-
-func (c *client) establishRegionClient(reg hrpc.RegionInfo,
-	host string, port uint16) (hrpc.RegionClient, error) {
-	if c.clientType != adminClient {
-		// if rpc is not for hbasemaster, check if client for regionserver
-		// already exists
-		if client := c.clients.checkForClient(host, port); client != nil {
-			// There's already a client
-			return client, nil
-		}
-	}
-
-	var clientType region.ClientType
-	if c.clientType == standardClient {
-		clientType = region.RegionClient
-	} else {
-		clientType = region.MasterClient
-	}
-	clientCtx, cancel := context.WithTimeout(context.Background(), regionLookupTimeout)
-	defer cancel()
-	return region.NewClient(clientCtx, host, port, clientType,
-		c.rpcQueueSize, c.flushInterval)
+	return backoff(t), nil
 }
 
 // zkResult contains the result of a ZooKeeper lookup (when we're looking for

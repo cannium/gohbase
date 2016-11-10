@@ -6,17 +6,17 @@
 package hrpc
 
 import (
+	"context"
 	"errors"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/cannium/gohbase/filter"
 	"github.com/cannium/gohbase/internal/pb"
-	"golang.org/x/net/context"
+	"github.com/golang/protobuf/proto"
 )
 
 // GetProcedureState represents a call to HBase to check status of a procedure
 type GetProcedureState struct {
-	base
+	rpcBase
 
 	procID uint64
 }
@@ -24,7 +24,7 @@ type GetProcedureState struct {
 // NewGetProcedureState creates a new GetProcedureState request. For use by the admin client.
 func NewGetProcedureState(ctx context.Context, procID uint64) *GetProcedureState {
 	return &GetProcedureState{
-		base: base{
+		rpcBase: rpcBase{
 			ctx: ctx,
 		},
 		procID: procID,

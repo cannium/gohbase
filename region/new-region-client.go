@@ -19,7 +19,7 @@ import (
 
 // NewClient creates a new RegionClient.
 func NewClient(ctx context.Context, host string, port uint16, ctype ClientType,
-	queueSize int, flushInterval time.Duration) (hrpc.RegionClient, error) {
+	queueSize int, flushInterval time.Duration) (*Client, error) {
 	addr := net.JoinHostPort(host, strconv.Itoa(int(port)))
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "tcp", addr)
@@ -27,15 +27,16 @@ func NewClient(ctx context.Context, host string, port uint16, ctype ClientType,
 		return nil, fmt.Errorf("failed to connect to the RegionServer at %s: %s", addr, err)
 	}
 
-	c := &client{
+	c := &Client{
 		host:          host,
 		port:          port,
 		conn:          conn,
-		rpcs:          make(chan hrpc.Call, queueSize),
+		rpcs:          make(chan hrpc.RpcCall, queueSize),
 		done:          make(chan struct{}),
-		sent:          make(map[uint32]hrpc.Call),
+		sent:          make(map[uint32]hrpc.RpcCall),
 		rpcQueueSize:  queueSize,
 		flushInterval: flushInterval,
+		regions:       make(map[string]*Region),
 	}
 
 	// time out send hello if it take long

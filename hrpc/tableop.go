@@ -13,7 +13,7 @@ import (
 
 // tableOp represents an administrative operation on a table.
 type tableOp struct {
-	base
+	rpcBase
 }
 
 // SetFilter always returns an error.

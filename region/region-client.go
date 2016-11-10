@@ -15,9 +15,9 @@ import (
 
 	log "github.com/Sirupsen/logrus"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/cannium/gohbase/hrpc"
 	"github.com/cannium/gohbase/internal/pb"
+	"github.com/golang/protobuf/proto"
 )
 
 // ClientType is a type alias to represent the type of this region client
@@ -35,6 +35,8 @@ var (
 	// ErrClientClosed is returned to rpcs when Close() is called
 	ErrClientClosed = errors.New("Client closed")
 
+	ErrRegionUnavailable = errors.New("Region is unavailable")
+
 	// javaRetryableExceptions is a map where all Java exceptions that signify
 	// the RPC should be sent again are listed (as keys). If a Java exception
 	// listed here is returned by HBase, the client should attempt to resend
@@ -44,6 +46,11 @@ var (
 		"org.apache.hadoop.hbase.exceptions.RegionMovedException":   struct{}{},
 		"org.apache.hadoop.hbase.exceptions.RegionOpeningException": struct{}{},
 	}
+
+	// queue size of region client
+	QUEUE_SIZE = 100
+	// timeout before flushing the queue in region client
+	FLUSH_INTERVAL = 20 * time.Millisecond
 )
 
 const (
@@ -77,7 +84,7 @@ func (e RetryableError) Error() string {
 }
 
 // client manages a connection to a RegionServer.
-type client struct {
+type Client struct {
 	conn io.ReadWriteCloser
 
 	// Hostname or IP address of the RegionServer.
@@ -86,16 +93,20 @@ type client struct {
 	// Port of the RegionServer.
 	port uint16
 
+	// Regions this client serves
+	regions     map[string]*Region
+	regionsLock sync.Mutex
+
 	// err is set once a write or read fails.
 	err  error
 	errM sync.RWMutex // protects err
 
-	rpcs chan hrpc.Call
+	rpcs chan hrpc.RpcCall
 	done chan struct{}
 
 	// sent contains the mapping of sent call IDs to RPC calls, so that when
 	// a response is received it can be tied to the correct RPC
-	sent  map[uint32]hrpc.Call
+	sent  map[uint32]hrpc.RpcCall
 	sentM sync.Mutex // protects sent
 
 	rpcQueueSize  int
@@ -104,12 +115,33 @@ type client struct {
 
 type call struct {
 	id uint32
-	hrpc.Call
+	hrpc.RpcCall
+}
+
+func (c *Client) AddRegion(r *Region) {
+	c.regionsLock.Lock()
+	defer c.regionsLock.Unlock()
+	c.regions[string(r.Table())+string(r.StartKey())] = r
+}
+
+func (c *Client) RemoveRegion(r *Region) {
+	c.regionsLock.Lock()
+	defer c.regionsLock.Unlock()
+	delete(c.regions, string(r.Table())+string(r.StartKey()))
+}
+
+func (c *Client) ClientDown() {
+	c.regionsLock.Lock()
+	defer c.regionsLock.Unlock()
+	for _, r := range c.regions {
+		r.MarkUnavailable()
+	}
+	c.Close()
 }
 
 // QueueRPC will add an rpc call to the queue for processing by the writer
 // goroutine
-func (c *client) QueueRPC(rpc hrpc.Call) error {
+func (c *Client) QueueRPC(rpc hrpc.RpcCall) error {
 	c.errM.RLock()
 	err := c.err
 	if err != nil {
@@ -124,21 +156,21 @@ func (c *client) QueueRPC(rpc hrpc.Call) error {
 // Close asks this region.Client to close its connection to the RegionServer.
 // All queued and outstanding RPCs, if any, will be failed as if a connection
 // error had happened.
-func (c *client) Close() {
-	c.fail(errors.New("Client closed"))
+func (c *Client) Close() {
+	c.fail(ErrClientClosed)
 }
 
 // Host returns the host that this client talks to
-func (c *client) Host() string {
+func (c *Client) Host() string {
 	return c.host
 }
 
 // Port returns the port that this client talks over
-func (c *client) Port() uint16 {
+func (c *Client) Port() uint16 {
 	return c.port
 }
 
-func (c *client) fail(err error) {
+func (c *Client) fail(err error) {
 	c.errM.Lock()
 	if c.err != nil {
 		c.errM.Unlock()
@@ -159,19 +191,19 @@ func (c *client) fail(err error) {
 	c.conn.Close()
 
 	// fail queued rpcs
-	var sent map[uint32]hrpc.Call
+	var sent map[uint32]hrpc.RpcCall
 	c.sentM.Lock()
 	sent = c.sent
-	c.sent = make(map[uint32]hrpc.Call)
+	c.sent = make(map[uint32]hrpc.RpcCall)
 	c.sentM.Unlock()
 	// send error to rpcs
-	res := hrpc.RPCResult{Error: err}
+	res := hrpc.RpcResult{Error: err}
 	for _, rpc := range sent {
 		rpc.ResultChan() <- res
 	}
 }
 
-func (c *client) processRPCs() {
+func (c *Client) processRPCs() {
 	batch := make([]*call, 0, c.rpcQueueSize)
 	ticker := time.NewTicker(c.flushInterval)
 	var currID uint32
@@ -194,8 +226,8 @@ func (c *client) processRPCs() {
 			c.sentM.Unlock()
 			// associate with id and append
 			batch = append(batch, &call{
-				id:   currID,
-				Call: rpc,
+				id:      currID,
+				RpcCall: rpc,
 			})
 			if len(batch) == c.rpcQueueSize {
 				go c.sendBatch(batch)
@@ -205,7 +237,7 @@ func (c *client) processRPCs() {
 	}
 }
 
-func (c *client) sendBatch(rpcs []*call) {
+func (c *Client) sendBatch(rpcs []*call) {
 	for _, rpc := range rpcs {
 		select {
 		case <-c.done:
@@ -227,7 +259,7 @@ func (c *client) sendBatch(rpcs []*call) {
 	}
 }
 
-func (c *client) receiveRPCs() {
+func (c *Client) receiveRPCs() {
 	for {
 		select {
 		case <-c.done:
@@ -241,7 +273,7 @@ func (c *client) receiveRPCs() {
 	}
 }
 
-func (c *client) receive() error {
+func (c *Client) receive() error {
 	var sz [4]byte
 	err := c.readFully(sz[:])
 	if err != nil {
@@ -292,12 +324,12 @@ func (c *client) receive() error {
 			err = RetryableError{err}
 		}
 	}
-	rpc.ResultChan() <- hrpc.RPCResult{Msg: rpcResp, Error: err}
+	rpc.ResultChan() <- hrpc.RpcResult{Msg: rpcResp, Error: err}
 	return nil
 }
 
 // write sends the given buffer to the RegionServer.
-func (c *client) write(buf []byte) error {
+func (c *Client) write(buf []byte) error {
 	n, err := c.conn.Write(buf)
 	if err != nil {
 		// There was an error while writing
@@ -312,7 +344,7 @@ func (c *client) write(buf []byte) error {
 }
 
 // Tries to read enough data to fully fill up the given buffer.
-func (c *client) readFully(buf []byte) error {
+func (c *Client) readFully(buf []byte) error {
 	_, err := io.ReadFull(c.conn, buf)
 	if err != nil {
 		return fmt.Errorf("Failed to read from the RS: %s", err)
@@ -321,7 +353,7 @@ func (c *client) readFully(buf []byte) error {
 }
 
 // sendHello sends the "hello" message needed when opening a new connection.
-func (c *client) sendHello(ctype ClientType) error {
+func (c *Client) sendHello(ctype ClientType) error {
 	connHeader := &pb.ConnectionHeader{
 		UserInfo: &pb.UserInformation{
 			EffectiveUser: proto.String("gopher"),
@@ -345,7 +377,7 @@ func (c *client) sendHello(ctype ClientType) error {
 
 // send sends an RPC out to the wire.
 // Returns the response (for now, as the call is synchronous).
-func (c *client) send(rpc *call) error {
+func (c *Client) send(rpc *call) error {
 	reqheader := &pb.RequestHeader{
 		CallId:       &rpc.id,
 		MethodName:   proto.String(rpc.Name()),

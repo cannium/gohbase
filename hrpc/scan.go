@@ -6,16 +6,16 @@
 package hrpc
 
 import (
+	"context"
 	"math"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/cannium/gohbase/filter"
 	"github.com/cannium/gohbase/internal/pb"
-	"golang.org/x/net/context"
+	"github.com/golang/protobuf/proto"
 )
 
 const (
-	// DefaultMaxVersions defualt value for maximum versions to return for scan queries
+	// DefaultMaxVersions default value for maximum versions to return for scan queries
 	DefaultMaxVersions uint32 = 1
 	// MinTimestamp default value for minimum timestamp for scan queries
 	MinTimestamp uint64 = 0
@@ -27,7 +27,7 @@ const (
 
 // Scan represents a scanner on an HBase table.
 type Scan struct {
-	base
+	rpcBase
 
 	// Maps a column family to a list of qualifiers
 	families map[string][]string
@@ -51,9 +51,9 @@ type Scan struct {
 
 // baseScan returns a Scan struct with default values set.
 func baseScan(ctx context.Context, table []byte, key []byte,
-	options ...func(Call) error) (*Scan, error) {
+	options ...func(RpcCall) error) (*Scan, error) {
 	s := &Scan{
-		base: base{
+		rpcBase: rpcBase{
 			key:   key,
 			table: table,
 			ctx:   ctx,
@@ -73,7 +73,7 @@ func baseScan(ctx context.Context, table []byte, key []byte,
 }
 
 // NewScan creates a scanner for the given table.
-func NewScan(ctx context.Context, table []byte, options ...func(Call) error) (*Scan, error) {
+func NewScan(ctx context.Context, table []byte, options ...func(RpcCall) error) (*Scan, error) {
 	return baseScan(ctx, table, []byte{}, options...)
 }
 
@@ -81,7 +81,7 @@ func NewScan(ctx context.Context, table []byte, options ...func(Call) error) (*S
 // The range is half-open, i.e. [startRow; stopRow[ -- stopRow is not
 // included in the range.
 func NewScanRange(ctx context.Context, table, startRow, stopRow []byte,
-	options ...func(Call) error) (*Scan, error) {
+	options ...func(RpcCall) error) (*Scan, error) {
 	scan, err := baseScan(ctx, table, startRow, options...)
 	if err != nil {
 		return nil, err
@@ -92,7 +92,7 @@ func NewScanRange(ctx context.Context, table, startRow, stopRow []byte,
 }
 
 // NewScanStr creates a scanner for the given table.
-func NewScanStr(ctx context.Context, table string, options ...func(Call) error) (*Scan, error) {
+func NewScanStr(ctx context.Context, table string, options ...func(RpcCall) error) (*Scan, error) {
 	return NewScan(ctx, []byte(table), options...)
 }
 
@@ -100,7 +100,7 @@ func NewScanStr(ctx context.Context, table string, options ...func(Call) error) 
 // The range is half-open, i.e. [startRow; stopRow[ -- stopRow is not
 // included in the range.
 func NewScanRangeStr(ctx context.Context, table, startRow, stopRow string,
-	options ...func(Call) error) (*Scan, error) {
+	options ...func(RpcCall) error) (*Scan, error) {
 	return NewScanRange(ctx, []byte(table), []byte(startRow), []byte(stopRow), options...)
 }
 
@@ -144,12 +144,6 @@ func (s *Scan) StartRow() []byte {
 // If no families are specified then all the families are scanned.
 func (s *Scan) Families() map[string][]string {
 	return s.families
-}
-
-// RegionStop returns the stop key of the region currently being scanned.
-// This is an internal method, end users are not expected to use it.
-func (s *Scan) RegionStop() []byte {
-	return s.region.StopKey()
 }
 
 // Filter returns the filter set on this scanner.

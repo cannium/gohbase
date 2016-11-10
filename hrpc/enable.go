@@ -6,9 +6,10 @@
 package hrpc
 
 import (
-	"github.com/golang/protobuf/proto"
+	"context"
+
 	"github.com/cannium/gohbase/internal/pb"
-	"golang.org/x/net/context"
+	"github.com/golang/protobuf/proto"
 )
 
 // EnableTable represents a EnableTable HBase call
@@ -20,7 +21,7 @@ type EnableTable struct {
 // given table in HBase. For use by the admin client.
 func NewEnableTable(ctx context.Context, table []byte) *EnableTable {
 	et := &EnableTable{
-		tableOp{base{
+		tableOp{rpcBase{
 			table: table,
 			ctx:   ctx,
 		}},

@@ -6,13 +6,15 @@
 package gohbase
 
 import (
+	"context"
 	"fmt"
+	"time"
 
 	"github.com/cannium/gohbase/hrpc"
 	"github.com/cannium/gohbase/internal/pb"
 )
 
-// AdminClient to perform admistrative operations with HMaster
+// AdminClient to perform administrative operations with HMaster
 type AdminClient interface {
 	CreateTable(t *hrpc.CreateTable) error
 	DeleteTable(t *hrpc.DeleteTable) error
@@ -28,7 +30,7 @@ func NewAdminClient(zkquorum string, options ...Option) AdminClient {
 }
 
 func (c *client) CreateTable(t *hrpc.CreateTable) error {
-	pbmsg, err := c.sendRPC(t)
+	pbmsg, _, err := c.sendRPC(t)
 	if err != nil {
 		return err
 	}
@@ -42,7 +44,7 @@ func (c *client) CreateTable(t *hrpc.CreateTable) error {
 }
 
 func (c *client) DeleteTable(t *hrpc.DeleteTable) error {
-	pbmsg, err := c.sendRPC(t)
+	pbmsg, _, err := c.sendRPC(t)
 	if err != nil {
 		return err
 	}
@@ -56,7 +58,7 @@ func (c *client) DeleteTable(t *hrpc.DeleteTable) error {
 }
 
 func (c *client) EnableTable(t *hrpc.EnableTable) error {
-	pbmsg, err := c.sendRPC(t)
+	pbmsg, _, err := c.sendRPC(t)
 	if err != nil {
 		return err
 	}
@@ -70,7 +72,7 @@ func (c *client) EnableTable(t *hrpc.EnableTable) error {
 }
 
 func (c *client) DisableTable(t *hrpc.DisableTable) error {
-	pbmsg, err := c.sendRPC(t)
+	pbmsg, _, err := c.sendRPC(t)
 	if err != nil {
 		return err
 	}
@@ -81,4 +83,35 @@ func (c *client) DisableTable(t *hrpc.DisableTable) error {
 	}
 
 	return c.checkProcedureWithBackoff(t.Context(), r.GetProcId())
+}
+
+func (c *client) checkProcedureWithBackoff(pContext context.Context, procID uint64) error {
+	backoff := backoffStart
+	ctx, cancel := context.WithTimeout(pContext, 30*time.Second)
+	defer cancel()
+
+	for {
+		req := hrpc.NewGetProcedureState(ctx, procID)
+		pbmsg, _, err := c.sendRPC(req)
+		if err != nil {
+			return err
+		}
+
+		statusRes, ok := pbmsg.(*pb.GetProcedureResultResponse)
+		if !ok {
+			return fmt.Errorf("sendRPC returned not a GetProcedureResultResponse")
+		}
+
+		switch statusRes.GetState() {
+		case pb.GetProcedureResultResponse_NOT_FOUND:
+			return fmt.Errorf("Procedure not found")
+		case pb.GetProcedureResultResponse_FINISHED:
+			return nil
+		default:
+			backoff, err = sleepAndIncreaseBackoff(ctx, backoff)
+			if err != nil {
+				return err
+			}
+		}
+	}
 }

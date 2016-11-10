@@ -7,6 +7,7 @@ package hrpc
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -15,10 +16,9 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/cannium/gohbase/filter"
 	"github.com/cannium/gohbase/internal/pb"
-	"golang.org/x/net/context"
+	"github.com/golang/protobuf/proto"
 )
 
 var (
@@ -53,7 +53,7 @@ const (
 
 // Mutate represents a mutation on HBase.
 type Mutate struct {
-	base
+	rpcBase
 
 	mutationType pb.MutationProto_MutationType //*int32
 
@@ -72,8 +72,8 @@ type Mutate struct {
 }
 
 // Timestamp sets timestamp for mutation queries.
-func Timestamp(ts time.Time) func(Call) error {
-	return func(o Call) error {
+func Timestamp(ts time.Time) func(RpcCall) error {
+	return func(o RpcCall) error {
 		m, ok := o.(*Mutate)
 		if !ok {
 			return errors.New("Timestamp option can only be used with mutation queries.")
@@ -84,8 +84,8 @@ func Timestamp(ts time.Time) func(Call) error {
 }
 
 // Durability sets durability for mutation queries.
-func Durability(d DurabilityType) func(Call) error {
-	return func(o Call) error {
+func Durability(d DurabilityType) func(RpcCall) error {
+	return func(o RpcCall) error {
 		m, ok := o.(*Mutate)
 		if !ok {
 			return errors.New("Durability option can only be used with mutation queries.")
@@ -100,9 +100,9 @@ func Durability(d DurabilityType) func(Call) error {
 
 // baseMutate returns a Mutate struct without the mutationType filled in.
 func baseMutate(ctx context.Context, table, key string, values map[string]map[string][]byte,
-	data interface{}, options ...func(Call) error) (*Mutate, error) {
+	data interface{}, options ...func(RpcCall) error) (*Mutate, error) {
 	m := &Mutate{
-		base: base{
+		rpcBase: rpcBase{
 			table: []byte(table),
 			key:   []byte(key),
 			ctx:   ctx,
@@ -121,7 +121,7 @@ func baseMutate(ctx context.Context, table, key string, values map[string]map[st
 // NewPutStr creates a new Mutation request to insert the given
 // family-column-values in the given row key of the given table.
 func NewPutStr(ctx context.Context, table, key string,
-	values map[string]map[string][]byte, options ...func(Call) error) (*Mutate, error) {
+	values map[string]map[string][]byte, options ...func(RpcCall) error) (*Mutate, error) {
 	m, err := baseMutate(ctx, table, key, values, nil, options...)
 	if err != nil {
 		return nil, err
@@ -134,7 +134,7 @@ func NewPutStr(ctx context.Context, table, key string,
 // data structure in the given row key of the given table.  The `data'
 // argument must be a string with fields defined using the "hbase" tag.
 func NewPutStrRef(ctx context.Context, table, key string, data interface{},
-	options ...func(Call) error) (*Mutate, error) {
+	options ...func(RpcCall) error) (*Mutate, error) {
 	if !isAStruct(data) {
 		return nil, ErrNotAStruct
 	}
@@ -149,7 +149,7 @@ func NewPutStrRef(ctx context.Context, table, key string, data interface{},
 // NewDelStr creates a new Mutation request to delete the given
 // family-column-values from the given row key of the given table.
 func NewDelStr(ctx context.Context, table, key string,
-	values map[string]map[string][]byte, options ...func(Call) error) (*Mutate, error) {
+	values map[string]map[string][]byte, options ...func(RpcCall) error) (*Mutate, error) {
 	m, err := baseMutate(ctx, table, key, values, nil, options...)
 	if err != nil {
 		return nil, err
@@ -162,7 +162,7 @@ func NewDelStr(ctx context.Context, table, key string,
 // data structure from the given row key of the given table.  The `data'
 // argument must be a string with fields defined using the "hbase" tag.
 func NewDelStrRef(ctx context.Context, table, key string, data interface{},
-	options ...func(Call) error) (*Mutate, error) {
+	options ...func(RpcCall) error) (*Mutate, error) {
 	if !isAStruct(data) {
 		return nil, ErrNotAStruct
 	}
@@ -178,7 +178,7 @@ func NewDelStrRef(ctx context.Context, table, key string, data interface{},
 // family-column-values into the existing cells in HBase (or create them if
 // needed), in given row key of the given table.
 func NewAppStr(ctx context.Context, table, key string,
-	values map[string]map[string][]byte, options ...func(Call) error) (*Mutate, error) {
+	values map[string]map[string][]byte, options ...func(RpcCall) error) (*Mutate, error) {
 	m, err := baseMutate(ctx, table, key, values, nil, options...)
 	if err != nil {
 		return nil, err
@@ -190,7 +190,7 @@ func NewAppStr(ctx context.Context, table, key string,
 // NewAppStrRef creates a new Mutation request that will append the given values
 // to their existing values in HBase under the given table and key.
 func NewAppStrRef(ctx context.Context, table, key string, data interface{},
-	options ...func(Call) error) (*Mutate, error) {
+	options ...func(RpcCall) error) (*Mutate, error) {
 	if !isAStruct(data) {
 		return nil, ErrNotAStruct
 	}
@@ -205,7 +205,7 @@ func NewAppStrRef(ctx context.Context, table, key string, data interface{},
 // NewIncStrSingle creates a new Mutation request that will increment the given value
 // by amount in HBase under the given table, key, family and qualifier.
 func NewIncStrSingle(ctx context.Context, table, key string, family string,
-	qualifier string, amount int64, options ...func(Call) error) (*Mutate, error) {
+	qualifier string, amount int64, options ...func(RpcCall) error) (*Mutate, error) {
 
 	buf := new(bytes.Buffer)
 	err := binary.Write(buf, binary.BigEndian, amount)
@@ -220,7 +220,7 @@ func NewIncStrSingle(ctx context.Context, table, key string, family string,
 // NewIncStr creates a new Mutation request that will increment the given values
 // in HBase under the given table and key.
 func NewIncStr(ctx context.Context, table, key string,
-	values map[string]map[string][]byte, options ...func(Call) error) (*Mutate, error) {
+	values map[string]map[string][]byte, options ...func(RpcCall) error) (*Mutate, error) {
 	m, err := baseMutate(ctx, table, key, values, nil, options...)
 	if err != nil {
 		return nil, err
@@ -232,7 +232,7 @@ func NewIncStr(ctx context.Context, table, key string,
 // NewIncStrRef creates a new Mutation request that will increment the given values
 // in HBase under the given table and key.
 func NewIncStrRef(ctx context.Context, table, key string, data interface{},
-	options ...func(Call) error) (*Mutate, error) {
+	options ...func(RpcCall) error) (*Mutate, error) {
 	if !isAStruct(data) {
 		return nil, ErrNotAStruct
 	}

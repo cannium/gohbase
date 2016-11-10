@@ -9,16 +9,13 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"sync"
 	"time"
 
 	log "github.com/Sirupsen/logrus"
-	"github.com/cznic/b"
 	"github.com/cannium/gohbase/hrpc"
 	"github.com/cannium/gohbase/internal/pb"
 	"github.com/cannium/gohbase/internal/zk"
 	"github.com/cannium/gohbase/region"
-	"golang.org/x/net/context"
 )
 
 const (
@@ -48,76 +45,11 @@ func SetZnodeParentOption(znodeParent string) Option {
 	}
 }
 
-// A Client provides access to an HBase cluster.
-type client struct {
-	clientType int
-
-	zkquorum string
-
-	regions keyRegionCache
-
-	// TODO: document what this protects.
-	regionsLock sync.Mutex
-
-	// Maps a hrpc.RegionInfo to the *region.Client that we think currently
-	// serves it.
-	clients clientRegionCache
-
-	metaRegionInfo hrpc.RegionInfo
-
-	adminRegionInfo hrpc.RegionInfo
-
-	// The maximum size of the RPC queue in the region client
-	rpcQueueSize int
-
-	// zkClient is zookeeper for retrieving meta and admin information
-	zkClient zk.Client
-
-	// The timeout before flushing the RPC queue in the region client
-	flushInterval time.Duration
-}
-
-// NewClient creates a new HBase client.
-func NewClient(zkquorum string, options ...Option) Client {
-	return newClient(zkquorum, options...)
-}
-
-func newClient(zkquorum string, options ...Option) *client {
-	log.WithFields(log.Fields{
-		"Host": zkquorum,
-	}).Debug("Creating new client.")
-	c := &client{
-		clientType: standardClient,
-		regions:    keyRegionCache{regions: b.TreeNew(region.CompareGeneric)},
-		clients: clientRegionCache{
-			regions: make(map[hrpc.RegionClient][]hrpc.RegionInfo),
-		},
-		zkquorum:      zkquorum,
-		rpcQueueSize:  100,
-		flushInterval: 20 * time.Millisecond,
-		metaRegionInfo: region.NewInfo(
-			[]byte("hbase:meta"),
-			[]byte("hbase:meta,,1"),
-			nil,
-			nil),
-		adminRegionInfo: region.NewInfo(
-			nil,
-			nil,
-			nil,
-			nil),
-		zkClient: zk.NewClient(zkquorum),
-	}
-	for _, option := range options {
-		option(c)
-	}
-	return c
-}
-
 // RpcQueueSize will return an option that will set the size of the RPC queues
 // used in a given client
 func RpcQueueSize(size int) Option {
 	return func(c *client) {
-		c.rpcQueueSize = size
+		region.QUEUE_SIZE = size
 	}
 }
 
@@ -125,20 +57,65 @@ func RpcQueueSize(size int) Option {
 // the RPC queues used in a given client
 func FlushInterval(interval time.Duration) Option {
 	return func(c *client) {
-		c.flushInterval = interval
+		region.FLUSH_INTERVAL = interval
 	}
 }
 
-// Close closes connections to hbase master and regionservers
+// A Client provides access to an HBase cluster.
+type client struct {
+	clientType int
+	zkQuorum   string
+
+	// `regions` caches tables and their regions
+	regions *regionCache
+
+	metaRegion  *region.Region
+	adminRegion *region.Region
+	// zkClient is zookeeper for retrieving meta and admin information
+	zkClient zk.Client
+}
+
+// NewClient creates a new HBase client.
+func NewClient(zkQuorum string, options ...Option) Client {
+	return newClient(zkQuorum, options...)
+}
+
+func newClient(zkQuorum string, options ...Option) *client {
+	log.WithFields(log.Fields{
+		"Host": zkQuorum,
+	}).Debug("Creating new client.")
+	c := &client{
+		clientType: standardClient,
+		regions:    newRegionCache(),
+		zkQuorum:   zkQuorum,
+		metaRegion: region.NewRegion(
+			metaTableName,
+			[]byte("hbase:meta,,1"),
+			nil,
+			nil),
+		adminRegion: region.NewRegion(
+			nil,
+			nil,
+			nil,
+			nil),
+		zkClient: zk.NewClient(zkQuorum),
+	}
+	for _, option := range options {
+		option(c)
+	}
+	return c
+}
+
+// Close closes connections to hbase master and region servers
 func (c *client) Close() {
-	// TODO: do we need a lock for metaRegionInfo and adminRegionInfo
-	if mc := c.metaRegionInfo.Client(); mc != nil {
+	// TODO: do we need a lock for metaRegion and adminRegion
+	if mc := c.metaRegion.Client(); mc != nil {
 		mc.Close()
 	}
-	if ac := c.adminRegionInfo.Client(); ac != nil {
+	if ac := c.adminRegion.Client(); ac != nil {
 		ac.Close()
 	}
-	c.clients.closeAll()
+	c.regions.close()
 }
 
 // Scan retrieves the values specified in families from the given range.
@@ -172,24 +149,24 @@ func (c *client) Scan(s *hrpc.Scan) ([]*hrpc.Result, error) {
 			return nil, err
 		}
 
-		res, err := c.sendRPC(rpc)
+		result, reg, err := c.sendRPC(rpc)
 		if err != nil {
 			return nil, err
 		}
-		scanResp = res.(*pb.ScanResponse)
+		scanResp = result.(*pb.ScanResponse)
 		results = append(results, scanResp.Results...)
 		receivedRows += uint32(len(scanResp.Results))
 
 		for scanResp.GetMoreResultsInRegion() ||
-			(len(scanResp.Results) > 0  && scanResp.GetMoreResults()) {
+			(len(scanResp.Results) > 0 && scanResp.GetMoreResults()) {
 
 			rpc = hrpc.NewScanFromID(ctx, table, *scanResp.ScannerId, rpc.Key())
 
-			res, err = c.sendRPC(rpc)
+			result, reg, err = c.sendRPC(rpc)
 			if err != nil {
 				return nil, err
 			}
-			scanResp = res.(*pb.ScanResponse)
+			scanResp = result.(*pb.ScanResponse)
 			results = append(results, scanResp.Results...)
 			receivedRows += uint32(len(scanResp.Results))
 		}
@@ -198,7 +175,7 @@ func (c *client) Scan(s *hrpc.Scan) ([]*hrpc.Result, error) {
 		if err != nil {
 			return nil, err
 		}
-		res, err = c.sendRPC(rpc)
+		result, reg, err = c.sendRPC(rpc)
 		// FIXME error would raise if this error is handled
 		// if err != nil {
 		// 	return nil, err
@@ -209,9 +186,9 @@ func (c *client) Scan(s *hrpc.Scan) ([]*hrpc.Result, error) {
 		// greater than or equal to the stop_key of this scanner provided
 		// that (2) we're not trying to scan until the end of the table).
 		// (1)
-		if len(rpc.RegionStop()) == 0 ||
+		if len(reg.StopKey()) == 0 ||
 			// (2)                (3)
-			(len(stopRow) != 0 && bytes.Compare(stopRow, rpc.RegionStop()) <= 0) ||
+			(len(stopRow) != 0 && bytes.Compare(stopRow, reg.StopKey()) <= 0) ||
 			(receivedRows != 0 && receivedRows >= numberOfRows) {
 
 			// Do we want to be returning a slice of Result objects or should we just
@@ -222,13 +199,13 @@ func (c *client) Scan(s *hrpc.Scan) ([]*hrpc.Result, error) {
 			}
 			return localResults, nil
 		} else {
-			startRow = rpc.RegionStop()
+			startRow = reg.StopKey()
 		}
 	}
 }
 
 func (c *client) Get(g *hrpc.Get) (*hrpc.Result, error) {
-	pbmsg, err := c.sendRPC(g)
+	pbmsg, _, err := c.sendRPC(g)
 	if err != nil {
 		return nil, err
 	}
@@ -269,7 +246,7 @@ func (c *client) Increment(i *hrpc.Mutate) (int64, error) {
 }
 
 func (c *client) mutate(m *hrpc.Mutate) (*hrpc.Result, error) {
-	pbmsg, err := c.sendRPC(m)
+	pbmsg, _, err := c.sendRPC(m)
 	if err != nil {
 		return nil, err
 	}
@@ -289,7 +266,7 @@ func (c *client) CheckAndPut(p *hrpc.Mutate, family string,
 		return false, err
 	}
 
-	pbmsg, err := c.sendRPC(cas)
+	pbmsg, _, err := c.sendRPC(cas)
 	if err != nil {
 		return false, err
 	}
@@ -305,35 +282,4 @@ func (c *client) CheckAndPut(p *hrpc.Mutate, family string,
 	}
 
 	return r.GetProcessed(), nil
-}
-
-func (c *client) checkProcedureWithBackoff(pContext context.Context, procID uint64) error {
-	backoff := backoffStart
-	ctx, cancel := context.WithTimeout(pContext, 30*time.Second)
-	defer cancel()
-
-	for {
-		req := hrpc.NewGetProcedureState(ctx, procID)
-		pbmsg, err := c.sendRPC(req)
-		if err != nil {
-			return err
-		}
-
-		statusRes, ok := pbmsg.(*pb.GetProcedureResultResponse)
-		if !ok {
-			return fmt.Errorf("sendRPC returned not a GetProcedureResultResponse")
-		}
-
-		switch statusRes.GetState() {
-		case pb.GetProcedureResultResponse_NOT_FOUND:
-			return fmt.Errorf("Procedure not found")
-		case pb.GetProcedureResultResponse_FINISHED:
-			return nil
-		default:
-			backoff, err = sleepAndIncreaseBackoff(ctx, backoff)
-			if err != nil {
-				return err
-			}
-		}
-	}
 }

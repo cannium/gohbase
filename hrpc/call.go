@@ -6,54 +6,30 @@
 package hrpc
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
 	"time"
 	"unsafe"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/cannium/gohbase/filter"
 	"github.com/cannium/gohbase/internal/pb"
-	"golang.org/x/net/context"
+	"github.com/golang/protobuf/proto"
 )
 
-// RegionInfo represents HBase region.
-type RegionInfo interface {
-	IsUnavailable() bool
-	AvailabilityChan() <-chan struct{}
-	MarkUnavailable() bool
-	MarkAvailable()
-	String() string
-	Name() []byte
-	StartKey() []byte
-	StopKey() []byte
-	Table() []byte
-	SetClient(RegionClient)
-	Client() RegionClient
-}
-
-// RegionClient represents HBase region client.
-type RegionClient interface {
-	Close()
-	Host() string
-	Port() uint16
-	QueueRPC(Call) error
-}
-
 // Call represents an HBase RPC call.
-type Call interface {
+type RpcCall interface {
 	Table() []byte
 	Name() string
 	Key() []byte
-	Region() RegionInfo
-	SetRegion(region RegionInfo)
+	SetRegionName(name []byte)
 	Serialize() ([]byte, error)
 	// Returns a newly created (default-state) protobuf in which to store the
 	// response of this call.
 	NewResponse() proto.Message
 
-	ResultChan() chan RPCResult
+	ResultChan() chan RpcResult
 
 	Context() context.Context
 
@@ -61,49 +37,44 @@ type Call interface {
 	SetFilter(ft filter.Filter) error
 }
 
-// RPCResult is struct that will contain both the resulting message from an RPC
+// RpcResult is struct that will contain both the resulting message from an RPC
 // call, and any errors that may have occurred related to making the RPC call.
-type RPCResult struct {
+type RpcResult struct {
 	Msg   proto.Message
 	Error error
 }
 
-type base struct {
+type rpcBase struct {
 	table []byte
 
 	key []byte
 
-	region RegionInfo
+	regionName []byte
 
-	// Protects access to resultch.
-	resultchLock sync.Mutex
-
-	resultch chan RPCResult
+	resultChannel chan RpcResult
+	// Protects access to result channel.
+	resultChannelLock sync.Mutex
 
 	ctx context.Context
 }
 
-func (b *base) Context() context.Context {
+func (b *rpcBase) Context() context.Context {
 	return b.ctx
 }
 
-func (b *base) Region() RegionInfo {
-	return b.region
+func (b *rpcBase) SetRegionName(name []byte) {
+	b.regionName = name
 }
 
-func (b *base) SetRegion(region RegionInfo) {
-	b.region = region
-}
-
-func (b *base) regionSpecifier() *pb.RegionSpecifier {
+func (b *rpcBase) regionSpecifier() *pb.RegionSpecifier {
 	regionType := pb.RegionSpecifier_REGION_NAME
 	return &pb.RegionSpecifier{
 		Type:  &regionType,
-		Value: []byte(b.region.Name()),
+		Value: b.regionName,
 	}
 }
 
-func applyOptions(call Call, options ...func(Call) error) error {
+func applyOptions(call RpcCall, options ...func(RpcCall) error) error {
 	for _, option := range options {
 		err := option(call)
 		if err != nil {
@@ -113,43 +84,43 @@ func applyOptions(call Call, options ...func(Call) error) error {
 	return nil
 }
 
-func (b *base) Table() []byte {
+func (b *rpcBase) Table() []byte {
 	return b.table
 }
 
-func (b *base) Key() []byte {
+func (b *rpcBase) Key() []byte {
 	return b.key
 }
 
-func (b *base) ResultChan() chan RPCResult {
-	b.resultchLock.Lock()
-	if b.resultch == nil {
+func (b *rpcBase) ResultChan() chan RpcResult {
+	b.resultChannelLock.Lock()
+	if b.resultChannel == nil {
 		// Buffered channels, so that if a writer thread sends a message (or
 		// reports an error) after the deadline it doesn't block due to the
 		// requesting thread having moved on.
-		b.resultch = make(chan RPCResult, 1)
+		b.resultChannel = make(chan RpcResult, 1)
 	}
-	b.resultchLock.Unlock()
-	return b.resultch
+	b.resultChannelLock.Unlock()
+	return b.resultChannel
 }
 
 // Families is used as a parameter for request creation. Adds families constraint to a request.
-func Families(fam map[string][]string) func(Call) error {
-	return func(g Call) error {
+func Families(fam map[string][]string) func(RpcCall) error {
+	return func(g RpcCall) error {
 		return g.SetFamilies(fam)
 	}
 }
 
 // Filters is used as a parameter for request creation. Adds filters constraint to a request.
-func Filters(fl filter.Filter) func(Call) error {
-	return func(g Call) error {
+func Filters(fl filter.Filter) func(RpcCall) error {
+	return func(g RpcCall) error {
 		return g.SetFilter(fl)
 	}
 }
 
 // TimeRange is used as a parameter for request creation. Adds TimeRange constraint to a request.
 // It will get values in range [from, to[ ('to' is exclusive).
-func TimeRange(from, to time.Time) func(Call) error {
+func TimeRange(from, to time.Time) func(RpcCall) error {
 	return TimeRangeUint64(uint64(from.UnixNano()/1e6), uint64(to.UnixNano()/1e6))
 }
 
@@ -157,8 +128,8 @@ func TimeRange(from, to time.Time) func(Call) error {
 // Adds TimeRange constraint to a request.
 // from and to should be in milliseconds
 // // It will get values in range [from, to[ ('to' is exclusive).
-func TimeRangeUint64(from, to uint64) func(Call) error {
-	return func(g Call) error {
+func TimeRangeUint64(from, to uint64) func(RpcCall) error {
+	return func(g RpcCall) error {
 		if from >= to {
 			// or equal is becuase 'to' is exclusive
 			return fmt.Errorf("'from' timestamp (%dms) is greater"+
@@ -181,8 +152,8 @@ func TimeRangeUint64(from, to uint64) func(Call) error {
 
 // MaxVersions is used as a parameter for request creation.
 // Adds MaxVersions constraint to a request.
-func MaxVersions(versions uint32) func(Call) error {
-	return func(g Call) error {
+func MaxVersions(versions uint32) func(RpcCall) error {
+	return func(g RpcCall) error {
 		switch c := g.(type) {
 		default:
 			return errors.New("MaxVersions option can only be used with Get or Scan queries.")
@@ -197,8 +168,8 @@ func MaxVersions(versions uint32) func(Call) error {
 
 // NumberOfRows is used as a parameter for request creation.
 // Adds NumberOfRows constraint to a request.
-func NumberOfRows(n uint32) func(Call) error {
-	return func(g Call) error {
+func NumberOfRows(n uint32) func(RpcCall) error {
+	return func(g RpcCall) error {
 		scan, ok := g.(*Scan)
 		if !ok {
 			return errors.New("NumberOfRows option can only be used with Scan queries.")

@@ -1,12 +1,14 @@
-# Golang HBase client [![Build Status](https://travis-ci.org/tsuna/gohbase.svg?branch=master)](https://travis-ci.org/tsuna/gohbase) [![codecov.io](http://codecov.io/github/tsuna/gohbase/coverage.svg?branch=master)](http://codecov.io/github/tsuna/gohbase?branch=master) [![GoDoc](https://godoc.org/github.com/tsuna/gohbase?status.png)](https://godoc.org/github.com/tsuna/gohbase)
+# Golang HBase client [![Build Status](https://travis-ci.org/tsuna/gohbase.svg?branch=master)](https://travis-ci.org/tsuna/gohbase)[![GoDoc](https://godoc.org/github.com/tsuna/gohbase?status.png)](https://godoc.org/github.com/tsuna/gohbase)
 
 This is a pure-[Go](http://golang.org/) client for [HBase](http://hbase.org).
 
-Current status: prototype.  
+Forked from [tsuna/gohbase](https://github.com/tsuna/gohbase) and core logic rewritten.
 
 ## Supported Versions
 
 HBase >= 1.0
+
+go >= 1.7
 
 ## Installation
 

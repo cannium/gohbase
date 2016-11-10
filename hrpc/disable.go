@@ -6,9 +6,10 @@
 package hrpc
 
 import (
-	"github.com/golang/protobuf/proto"
+	"context"
+
 	"github.com/cannium/gohbase/internal/pb"
-	"golang.org/x/net/context"
+	"github.com/golang/protobuf/proto"
 )
 
 // DisableTable represents a DisableTable HBase call
@@ -20,7 +21,7 @@ type DisableTable struct {
 // given table in HBase. For use by the admin client.
 func NewDisableTable(ctx context.Context, table []byte) *DisableTable {
 	dt := &DisableTable{
-		tableOp{base{
+		tableOp{rpcBase{
 			table: table,
 			ctx:   ctx,
 		}},

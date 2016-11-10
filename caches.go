@@ -7,206 +7,222 @@ package gohbase
 
 import (
 	"bytes"
-	"io"
+	"context"
+	"fmt"
 	"sync"
 
+	"github.com/cannium/gohbase/region"
 	"github.com/cznic/b"
-	"github.com/cannium/gohbase/hrpc"
 )
 
-// clientRegionCache is client -> region cache. Used to quickly
-// look up all the regioninfos that map to a specific client
-type clientRegionCache struct {
-	m sync.Mutex
-
-	regions map[hrpc.RegionClient][]hrpc.RegionInfo
+type clientCache struct {
+	lock *sync.RWMutex
+	// maps connection string(host:port) -> region client
+	clients map[string]*region.Client
 }
 
-func (rcc *clientRegionCache) put(c hrpc.RegionClient, r hrpc.RegionInfo) {
-	rcc.m.Lock()
-	defer rcc.m.Unlock()
-
-	lst := rcc.regions[c]
-	for _, existing := range lst {
-		if existing == r {
-			return
-		}
+func newClientCache() *clientCache {
+	return &clientCache{
+		lock:    new(sync.RWMutex),
+		clients: make(map[string]*region.Client),
 	}
-	rcc.regions[c] = append(lst, r)
 }
 
-func (rcc *clientRegionCache) del(r hrpc.RegionInfo) {
-	rcc.m.Lock()
-	c := r.Client()
-	if c != nil {
-		r.SetClient(nil)
-
-		rs := rcc.regions[c]
-		var index int
-		for i, reg := range rs {
-			if reg == r {
-				index = i
-			}
-		}
-		rs = append(rs[:index], rs[index+1:]...)
-
-		if len(rs) == 0 {
-			// close region client if noone is using it
-			delete(rcc.regions, c)
-			c.Close()
-		} else {
-			rcc.regions[c] = rs
-		}
+func (c *clientCache) get(host string, port uint16) *region.Client {
+	connection := fmt.Sprintf("%s:%d", host, port)
+	c.lock.RLock()
+	client, hit := c.clients[connection]
+	c.lock.RUnlock()
+	if hit {
+		return client
+	} else {
+		return nil
 	}
-	rcc.m.Unlock()
 }
 
-func (rcc *clientRegionCache) closeAll() {
-	rcc.m.Lock()
-	for client, regions := range rcc.regions {
-		for _, region := range regions {
-			region.MarkUnavailable()
-			region.SetClient(nil)
-		}
-		client.Close()
+func (c *clientCache) put(host string, port uint16, client *region.Client) {
+	connection := fmt.Sprintf("%s:%d", host, port)
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	c.clients[connection] = client
+}
+
+func (c *clientCache) del(host string, port uint16) {
+	connection := fmt.Sprintf("%s:%d", host, port)
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	delete(c.clients, connection)
+}
+
+func (c *clientCache) closeAll() {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	for _, client := range c.clients {
+		client.ClientDown()
 	}
-	rcc.m.Unlock()
 }
 
-func (rcc *clientRegionCache) clientDown(reg hrpc.RegionInfo) []hrpc.RegionInfo {
-	rcc.m.Lock()
-	var downregions []hrpc.RegionInfo
-	c := reg.Client()
-	for _, sharedReg := range rcc.regions[c] {
-		succ := sharedReg.MarkUnavailable()
-		sharedReg.SetClient(nil)
-		if succ {
-			downregions = append(downregions, sharedReg)
-		}
+type regionCache struct {
+	lock *sync.Mutex
+	// maps table -> start key -> region
+	// type: string -> []byte -> *region.Region
+	regions map[string]*b.Tree
+	// table lock protects corresponding tree in this cache
+	tableLocks map[string]*sync.Mutex
+
+	// `clients` caches region clients, excluding meta region client
+	// and admin region client
+	clients *clientCache
+}
+
+func newRegionCache() *regionCache {
+	return &regionCache{
+		lock:       new(sync.Mutex),
+		regions:    make(map[string]*b.Tree),
+		tableLocks: make(map[string]*sync.Mutex),
+		clients:    newClientCache(),
 	}
-	delete(rcc.regions, c)
-	rcc.m.Unlock()
-	return downregions
 }
 
-func (rcc *clientRegionCache) checkForClient(host string, port uint16) hrpc.RegionClient {
-	rcc.m.Lock()
-	defer rcc.m.Unlock()
+// Check if the B+ tree for specific table exists, if not, create the tree
+// with a sentinel region inside
+// Note the sentinel regions have empty name and they should be set before use
+func (c *regionCache) getTree(table []byte) *b.Tree {
+	c.lock.Lock()
+	defer c.lock.Unlock()
 
-	for client := range rcc.regions {
-		if client.Host() == host && client.Port() == port {
-			return client
-		}
+	tree, ok := c.regions[string(table)]
+	if ok {
+		return tree
 	}
-	return nil
+
+	tree = b.TreeNew(region.GenericCompare)
+	r := region.NewRegion(table, nil, []byte(""), []byte(""))
+	tree.Set([]byte(""), r)
+	c.regions[string(table)] = tree
+	c.tableLocks[string(table)] = new(sync.Mutex)
+	return tree
 }
 
-// key -> region cache.
-type keyRegionCache struct {
-	m sync.Mutex
+// return a working region for (table, key) pair
+func (c *regionCache) get(ctx context.Context, table, key []byte,
+	onUnavailable func(context.Context) (*region.Region, string, uint16, error)) (*region.Region, error) {
 
-	// Maps a []byte of a region start key to a hrpc.RegionInfo
-	regions *b.Tree
-}
+	tree := c.getTree(table)
+	tableLock := c.tableLocks[string(table)]
 
-func (krc *keyRegionCache) get(key []byte) ([]byte, hrpc.RegionInfo) {
-	// When seeking - "The Enumerator's position is possibly after the last item in the tree"
-	// http://godoc.org/github.com/cznic/b#Tree.Set
-	krc.m.Lock()
-
-	enum, ok := krc.regions.Seek(key)
-	k, v, err := enum.Prev()
-	if err == io.EOF && krc.regions.Len() > 0 {
-		// We're past the end of the tree. Return the last element instead.
-		// (Without this code we always get a cache miss and create a new client for each req.)
-		k, v = krc.regions.Last()
-		err = nil
-	} else if !ok {
-		k, v, err = enum.Prev()
+	tableLock.Lock()
+	enumerator, _ := tree.Seek(key)
+	// get current item and move the enumerator to next; we don't care
+	// about next, though
+	_, v, err := enumerator.Next()
+	enumerator.Close()
+	if err != nil { // surely not io.EOF because we have a sentinel region
+		tableLock.Unlock()
+		return nil, err
 	}
-	enum.Close()
+
+	cachedRegion := v.(*region.Region)
+	if cachedRegion.Available() {
+		tableLock.Unlock()
+		return cachedRegion, nil
+	}
+
+	// cachedRegion unavailable, find it from HBase
+	fetchedRegion, host, port, err := onUnavailable(ctx)
 	if err != nil {
-		krc.m.Unlock()
-		return nil, nil
+		tableLock.Unlock()
+		return nil, err
 	}
-	krc.m.Unlock()
-	return k.([]byte), v.(hrpc.RegionInfo)
-}
-
-func isRegionOverlap(regA, regB hrpc.RegionInfo) bool {
-	return bytes.Equal(regA.Table(), regB.Table()) &&
-		bytes.Compare(regA.StartKey(), regB.StopKey()) < 0 &&
-		bytes.Compare(regA.StopKey(), regB.StartKey()) > 0
-}
-
-func (krc *keyRegionCache) getOverlaps(reg hrpc.RegionInfo) []hrpc.RegionInfo {
-	var overlaps []hrpc.RegionInfo
-	var v interface{}
-	var err error
-
-	// deal with empty tree in the beginning so that we don't have to check
-	// EOF errors for enum later
-	if krc.regions.Len() == 0 {
-		return overlaps
+	if rangeEqual(cachedRegion, fetchedRegion) {
+		tableLock.Unlock()
+		cachedRegion.SetName(fetchedRegion.Name())
+		c.establishRegion(ctx, cachedRegion, host, port)
+		return cachedRegion, nil
 	}
 
-	enum, ok := krc.regions.Seek(reg.Name())
-	if !ok {
-		// need to check if there are overlaps before what we found
-		_, _, err = enum.Prev()
-		if err == io.EOF {
-			// we are in the end of tree, get last entry
-			_, v = krc.regions.Last()
-			currReg := v.(hrpc.RegionInfo)
-			if isRegionOverlap(currReg, reg) {
-				return append(overlaps, currReg)
-			}
-		} else {
-			_, v, err = enum.Next()
-			if err == io.EOF {
-				// we are before the beginning of the tree now, get new enum
-				enum.Close()
-				enum, err = krc.regions.SeekFirst()
-			} else {
-				// otherwise, check for overlap before us
-				currReg := v.(hrpc.RegionInfo)
-				if isRegionOverlap(currReg, reg) {
-					overlaps = append(overlaps, currReg)
-				}
-			}
+	// find the full key interval affected by fetchedRegion, remove those regions,
+	// insert fetchedRegion and other necessary regions
+	var affectedStart, affectedStop []byte
+	enumerator, _ = tree.Seek(fetchedRegion.StartKey())
+	_, v, err = enumerator.Next()
+	for err == nil {
+		r := v.(*region.Region)
+		if !isRegionOverlap(fetchedRegion, r) {
+			break
 		}
-	}
 
-	// now append all regions that overlap until the end of the tree
-	// or until they don't overlap
-	_, v, err = enum.Next()
-	for err == nil && isRegionOverlap(v.(hrpc.RegionInfo), reg) {
-		overlaps = append(overlaps, v.(hrpc.RegionInfo))
-		_, v, err = enum.Next()
+		if affectedStart == nil || bytes.Compare(r.StartKey(), affectedStart) < 0 {
+			affectedStart = r.StartKey()
+		}
+		// []byte("") is the smallest for bytes.Compare, but it means +inf
+		// for stop keys
+		if affectedStop == nil || bytes.Compare(affectedStop, r.StopKey()) < 0 ||
+			len(r.StopKey()) == 0 {
+			affectedStop = r.StopKey()
+		}
+		markRegionUnavailable(r)
+		tree.Delete(r.StartKey())
+
+		_, v, err = enumerator.Next()
 	}
-	enum.Close()
-	return overlaps
+	enumerator.Close()
+	if !bytes.Equal(affectedStart, fetchedRegion.StartKey()) {
+		newRegion := region.NewRegion(table, nil, affectedStart, fetchedRegion.StartKey())
+		tree.Set(newRegion.StartKey(), newRegion)
+	}
+	if !bytes.Equal(affectedStop, fetchedRegion.StopKey()) {
+		newRegion := region.NewRegion(table, nil, fetchedRegion.StopKey(), affectedStop)
+		tree.Set(newRegion.StartKey(), newRegion)
+	}
+	tree.Set(fetchedRegion.StartKey(), fetchedRegion)
+	tableLock.Unlock()
+
+	c.establishRegion(ctx, fetchedRegion, host, port)
+	return fetchedRegion, nil
 }
 
-func (krc *keyRegionCache) put(reg hrpc.RegionInfo) []hrpc.RegionInfo {
-	krc.m.Lock()
-	defer krc.m.Unlock()
-
-	// Remove all the entries that are overlap with the range of the new region.
-	os := krc.getOverlaps(reg)
-	for _, o := range os {
-		krc.regions.Delete(o.Name())
+// Mark region as unavailable, maintain both Region and Client
+func markRegionUnavailable(r *region.Region) {
+	client := r.MarkUnavailable()
+	if client != nil {
+		client.RemoveRegion(r)
 	}
-
-	krc.regions.Put(reg.Name(), func(interface{}, bool) (interface{}, bool) {
-		return reg, true
-	})
-	return os
 }
 
-func (krc *keyRegionCache) del(key []byte) bool {
-	krc.m.Lock()
-	success := krc.regions.Delete(key)
-	krc.m.Unlock()
-	return success
+func (c *regionCache) establishRegion(ctx context.Context, r *region.Region,
+	host string, port uint16) {
+
+	// get client from cache
+	client := c.clients.get(host, port)
+	if client != nil {
+		r.SetClient(client)
+		client.AddRegion(r)
+		return
+	}
+
+	// create new client if client not exists yet
+	client = r.Connect(ctx, host, port)
+	if client != nil {
+		client.AddRegion(r)
+		c.clients.put(host, port, client)
+	}
+}
+
+func (c *regionCache) close() {
+	c.clients.closeAll()
+}
+
+func rangeEqual(A, B *region.Region) bool {
+	return bytes.Equal(A.StartKey(), B.StartKey()) &&
+		bytes.Equal(A.StopKey(), B.StopKey())
+}
+
+func isRegionOverlap(regA, regB *region.Region) bool {
+	// []byte("") is the smallest for bytes.Compare, but it means +inf
+	// for stop keys
+	return (bytes.Compare(regA.StartKey(), regB.StopKey()) < 0 ||
+		len(regB.StopKey()) == 0) &&
+		(bytes.Compare(regA.StopKey(), regB.StartKey()) > 0 ||
+			len(regA.StopKey()) == 0)
 }

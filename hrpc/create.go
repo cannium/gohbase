@@ -6,9 +6,10 @@
 package hrpc
 
 import (
-	"github.com/golang/protobuf/proto"
+	"context"
+
 	"github.com/cannium/gohbase/internal/pb"
-	"golang.org/x/net/context"
+	"github.com/golang/protobuf/proto"
 )
 
 // CreateTable represents a CreateTable HBase call
@@ -38,7 +39,7 @@ var defaultAttributes = map[string]string{
 func NewCreateTable(ctx context.Context, table []byte,
 	families map[string]map[string]string) *CreateTable {
 	ct := &CreateTable{
-		tableOp: tableOp{base{
+		tableOp: tableOp{rpcBase{
 			table: table,
 			ctx:   ctx,
 		}},

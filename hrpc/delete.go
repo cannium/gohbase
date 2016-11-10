@@ -6,9 +6,10 @@
 package hrpc
 
 import (
-	"github.com/golang/protobuf/proto"
+	"context"
+
 	"github.com/cannium/gohbase/internal/pb"
-	"golang.org/x/net/context"
+	"github.com/golang/protobuf/proto"
 )
 
 // DeleteTable represents a DeleteTable HBase call
@@ -20,7 +21,7 @@ type DeleteTable struct {
 // given table in HBase. For use by the admin client.
 func NewDeleteTable(ctx context.Context, table []byte) *DeleteTable {
 	dt := &DeleteTable{
-		tableOp{base{
+		tableOp{rpcBase{
 			table: table,
 			ctx:   ctx,
 		}},

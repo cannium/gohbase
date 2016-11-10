@@ -6,15 +6,16 @@
 package hrpc
 
 import (
-	"github.com/golang/protobuf/proto"
+	"context"
+
 	"github.com/cannium/gohbase/filter"
 	"github.com/cannium/gohbase/internal/pb"
-	"golang.org/x/net/context"
+	"github.com/golang/protobuf/proto"
 )
 
 // Get represents a Get HBase call.
 type Get struct {
-	base
+	rpcBase
 
 	families map[string][]string //Maps a column family to a list of qualifiers
 
@@ -36,9 +37,9 @@ type Get struct {
 
 // baseGet returns a Get struct with default values set.
 func baseGet(ctx context.Context, table []byte, key []byte,
-	options ...func(Call) error) (*Get, error) {
+	options ...func(RpcCall) error) (*Get, error) {
 	g := &Get{
-		base: base{
+		rpcBase: rpcBase{
 			key:   key,
 			table: table,
 			ctx:   ctx,
@@ -56,20 +57,20 @@ func baseGet(ctx context.Context, table []byte, key []byte,
 
 // NewGet creates a new Get request for the given table and row key.
 func NewGet(ctx context.Context, table, key []byte,
-	options ...func(Call) error) (*Get, error) {
+	options ...func(RpcCall) error) (*Get, error) {
 	return baseGet(ctx, table, key, options...)
 }
 
 // NewGetStr creates a new Get request for the given table and row key.
 func NewGetStr(ctx context.Context, table, key string,
-	options ...func(Call) error) (*Get, error) {
+	options ...func(RpcCall) error) (*Get, error) {
 	return NewGet(ctx, []byte(table), []byte(key), options...)
 }
 
 // NewGetBefore creates a new Get request for the row with a key equal to or
 // immediately less than the given key, in the given table.
 func NewGetBefore(ctx context.Context, table, key []byte,
-	options ...func(Call) error) (*Get, error) {
+	options ...func(RpcCall) error) (*Get, error) {
 	g, err := baseGet(ctx, table, key, options...)
 	if err != nil {
 		return nil, err
