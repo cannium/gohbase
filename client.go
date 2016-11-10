@@ -178,7 +178,7 @@ func (c *client) Scan(s *hrpc.Scan) ([]*hrpc.Result, error) {
 		}
 		scanResp = res.(*pb.ScanResponse)
 		results = append(results, scanResp.Results...)
-		receivedRows += len(scanResp.Results)
+		receivedRows += uint32(len(scanResp.Results))
 
 		for scanResp.GetMoreResultsInRegion() ||
 			(len(scanResp.Results) > 0  && scanResp.GetMoreResults()) {
@@ -191,7 +191,7 @@ func (c *client) Scan(s *hrpc.Scan) ([]*hrpc.Result, error) {
 			}
 			scanResp = res.(*pb.ScanResponse)
 			results = append(results, scanResp.Results...)
-			receivedRows += len(scanResp.Results)
+			receivedRows += uint32(len(scanResp.Results))
 		}
 
 		rpc = hrpc.NewCloseFromID(ctx, table, *scanResp.ScannerId, rpc.Key())
