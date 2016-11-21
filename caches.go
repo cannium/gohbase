@@ -12,7 +12,6 @@ import (
 	"sync"
 
 	"github.com/cannium/gohbase/region"
-	"github.com/cznic/b"
 )
 
 type clientCache struct {
@@ -64,11 +63,10 @@ func (c *clientCache) closeAll() {
 
 type regionCache struct {
 	lock *sync.Mutex
-	// maps table -> start key -> region
-	// type: string -> []byte -> *region.Region
-	regions map[string]*b.Tree
-	// table lock protects corresponding tree in this cache
-	tableLocks map[string]*sync.Mutex
+	// Regions are organized in balanced binary trees
+	// maps table -> region tree
+	// type: string -> *region.Region
+	regions map[string]*region.Region
 
 	// `clients` caches region clients, excluding meta region client
 	// and admin region client
@@ -78,16 +76,13 @@ type regionCache struct {
 func newRegionCache() *regionCache {
 	return &regionCache{
 		lock:       new(sync.Mutex),
-		regions:    make(map[string]*b.Tree),
-		tableLocks: make(map[string]*sync.Mutex),
+		regions:    make(map[string]*region.Region),
 		clients:    newClientCache(),
 	}
 }
 
-// Check if the B+ tree for specific table exists, if not, create the tree
-// with a sentinel region inside
-// Note the sentinel regions have empty name and they should be set before use
-func (c *regionCache) getTree(table []byte) *b.Tree {
+// Check if the binary tree for specific table exists, if not, create it
+func (c *regionCache) getTree(table []byte) *region.Region {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
@@ -96,11 +91,8 @@ func (c *regionCache) getTree(table []byte) *b.Tree {
 		return tree
 	}
 
-	tree = b.TreeNew(region.GenericCompare)
-	r := region.NewRegion(table, nil, []byte(""), []byte(""))
-	tree.Set([]byte(""), r)
+	tree = region.NewRegion(table, nil, []byte(""), []byte(""))
 	c.regions[string(table)] = tree
-	c.tableLocks[string(table)] = new(sync.Mutex)
 	return tree
 }
 
@@ -109,75 +101,27 @@ func (c *regionCache) get(ctx context.Context, table, key []byte,
 	onUnavailable func(context.Context) (*region.Region, string, uint16, error)) (*region.Region, error) {
 
 	tree := c.getTree(table)
-	tableLock := c.tableLocks[string(table)]
-
-	tableLock.Lock()
-	enumerator, _ := tree.Seek(key)
-	// get current item and move the enumerator to next; we don't care
-	// about next, though
-	_, v, err := enumerator.Next()
-	enumerator.Close()
-	if err != nil { // surely not io.EOF because we have a sentinel region
-		tableLock.Unlock()
-		return nil, err
-	}
-
-	cachedRegion := v.(*region.Region)
+	cachedRegion := tree.Find(key)
+	// lock the region so other requests of same region would wait for the region
+	// to become available
+	cachedRegion.Lock()
+	defer cachedRegion.Unlock()
 	if cachedRegion.Available() {
-		tableLock.Unlock()
 		return cachedRegion, nil
 	}
 
 	// cachedRegion unavailable, find it from HBase
 	fetchedRegion, host, port, err := onUnavailable(ctx)
 	if err != nil {
-		tableLock.Unlock()
 		return nil, err
 	}
 	if rangeEqual(cachedRegion, fetchedRegion) {
-		tableLock.Unlock()
 		cachedRegion.SetName(fetchedRegion.Name())
 		c.establishRegion(ctx, cachedRegion, host, port)
 		return cachedRegion, nil
 	}
-
-	// find the full key interval affected by fetchedRegion, remove those regions,
-	// insert fetchedRegion and other necessary regions
-	var affectedStart, affectedStop []byte
-	enumerator, _ = tree.Seek(fetchedRegion.StartKey())
-	_, v, err = enumerator.Next()
-	for err == nil {
-		r := v.(*region.Region)
-		if !isRegionOverlap(fetchedRegion, r) {
-			break
-		}
-
-		if affectedStart == nil || bytes.Compare(r.StartKey(), affectedStart) < 0 {
-			affectedStart = r.StartKey()
-		}
-		// []byte("") is the smallest for bytes.Compare, but it means +inf
-		// for stop keys
-		if affectedStop == nil || bytes.Compare(affectedStop, r.StopKey()) < 0 ||
-			len(r.StopKey()) == 0 {
-			affectedStop = r.StopKey()
-		}
-		markRegionUnavailable(r)
-		tree.Delete(r.StartKey())
-
-		_, v, err = enumerator.Next()
-	}
-	enumerator.Close()
-	if !bytes.Equal(affectedStart, fetchedRegion.StartKey()) {
-		newRegion := region.NewRegion(table, nil, affectedStart, fetchedRegion.StartKey())
-		tree.Set(newRegion.StartKey(), newRegion)
-	}
-	if !bytes.Equal(affectedStop, fetchedRegion.StopKey()) {
-		newRegion := region.NewRegion(table, nil, fetchedRegion.StopKey(), affectedStop)
-		tree.Set(newRegion.StartKey(), newRegion)
-	}
-	tree.Set(fetchedRegion.StartKey(), fetchedRegion)
-	tableLock.Unlock()
-
+	// TODO: support region merge
+	cachedRegion.Split(fetchedRegion)
 	c.establishRegion(ctx, fetchedRegion, host, port)
 	return fetchedRegion, nil
 }
@@ -218,11 +162,3 @@ func rangeEqual(A, B *region.Region) bool {
 		bytes.Equal(A.StopKey(), B.StopKey())
 }
 
-func isRegionOverlap(regA, regB *region.Region) bool {
-	// []byte("") is the smallest for bytes.Compare, but it means +inf
-	// for stop keys
-	return (bytes.Compare(regA.StartKey(), regB.StopKey()) < 0 ||
-		len(regB.StopKey()) == 0) &&
-		(bytes.Compare(regA.StopKey(), regB.StartKey()) > 0 ||
-			len(regA.StopKey()) == 0)
-}

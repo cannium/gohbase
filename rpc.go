@@ -65,10 +65,6 @@ func (c *client) sendRPC(rpc hrpc.RpcCall) (proto.Message, *region.Region, error
 			return nil, nil, err
 		}
 
-		if !r.Available() {
-			return nil, nil, region.ErrRegionUnavailable
-		}
-
 		rpc.SetRegionName(r.Name())
 		r.Client().QueueRPC(rpc)
 
@@ -131,42 +127,6 @@ func (c *client) ensuredAdminRegion(rootContext context.Context) (*region.Region
 func (c *client) ensureMetaRegion(rootContext context.Context) (*region.Region, error) {
 	err := c.ensureRegionHelper(rootContext, c.metaRegion, zk.Meta, region.RegionClient)
 	return c.metaRegion, err
-}
-
-func (c *client) lookupRegion(ctx context.Context,
-	table, key []byte) (*region.Region, string, uint16, error) {
-	var reg *region.Region
-	var host string
-	var port uint16
-	var err error
-	backoff := backoffStart
-	for {
-		// If it takes longer than regionLookupTimeout, fail so that we can sleep
-		lookupCtx, cancel := context.WithTimeout(ctx, regionLookupTimeout)
-		if c.clientType == adminClient {
-			host, port, err = c.zkLookup(lookupCtx, zk.Master)
-			cancel()
-			reg = c.adminRegion
-		} else if bytes.Compare(table, c.metaRegion.Table()) == 0 {
-			host, port, err = c.zkLookup(lookupCtx, zk.Meta)
-			cancel()
-			reg = c.metaRegion
-		} else {
-			reg, host, port, err = c.metaLookup(lookupCtx, table, key)
-			cancel()
-			if err == TableNotFound {
-				return nil, "", 0, err
-			}
-		}
-		if err == nil {
-			return reg, host, port, nil
-		}
-		// This will be hit if there was an error locating the region
-		backoff, err = sleepAndIncreaseBackoff(ctx, backoff)
-		if err != nil {
-			return nil, "", 0, err
-		}
-	}
 }
 
 // Creates the META key to search for in order to locate the given key.

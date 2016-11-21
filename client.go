@@ -172,14 +172,10 @@ func (c *client) Scan(s *hrpc.Scan) ([]*hrpc.Result, error) {
 		}
 
 		rpc = hrpc.NewCloseFromID(ctx, table, *scanResp.ScannerId, rpc.Key())
-		if err != nil {
-			return nil, err
-		}
+
 		result, reg, err = c.sendRPC(rpc)
-		// FIXME error would raise if this error is handled
-		// if err != nil {
-		// 	return nil, err
-		// }
+		// Note: this error is deliberately ignored, as in java and other clients,
+		// (TODO) but they handle partial results and heartbeat message
 
 		// Check to see if this region is the last we should scan (either
 		// because (1) it's the last region or (3) because its stop_key is

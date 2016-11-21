@@ -19,14 +19,23 @@ import (
 )
 
 type Region struct {
-	table []byte
+	table         []byte
 	// The attributes above are supposed to be immutable.
 
-	name     []byte
-	startKey []byte
-	stopKey  []byte
-	lock     sync.RWMutex
-	client   *Client
+	lock          sync.RWMutex
+	name          []byte
+	startKey      []byte
+	stopKey       []byte
+	splitKey      []byte  // the key to determine left and right
+	client        *Client
+	availableLock sync.Mutex
+
+	// Region is organized in a balanced binary tree
+	left          *Region
+	right         *Region
+	parent        *Region
+	leftHeight    int // height of left child
+	rightHeight   int // height of right child
 }
 
 // NewInfo creates a new region info
@@ -36,6 +45,10 @@ func NewRegion(table, name, startKey, stopKey []byte) *Region {
 		name:     name,
 		startKey: startKey,
 		stopKey:  stopKey,
+		// define height of leaf node child to be -1 so height of
+		// a node would always be max(leftHeight + rightHeight) + 1
+		leftHeight: -1,
+		rightHeight: -1,
 	}
 }
 
@@ -59,12 +72,8 @@ func regionFromCell(cell *hrpc.Cell) (*Region, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode %q: %s", cell, err)
 	}
-	return &Region{
-		table:    regInfo.TableName.Qualifier,
-		name:     cell.Row,
-		startKey: regInfo.StartKey,
-		stopKey:  regInfo.EndKey,
-	}, nil
+	return NewRegion(regInfo.TableName.Qualifier, cell.Row,
+		regInfo.StartKey, regInfo.EndKey), nil
 }
 
 // ParseRegionInfo parses the contents of a row from the meta table.
@@ -126,6 +135,14 @@ func (r *Region) Available() bool {
 	r.lock.RLock()
 	defer r.lock.RUnlock()
 	return r.client != nil
+}
+
+func (r *Region) Lock() {
+	r.availableLock.Lock()
+}
+
+func (r *Region) Unlock() {
+	r.availableLock.Unlock()
 }
 
 func (r *Region) MarkUnavailable() *Client {
@@ -203,100 +220,229 @@ func (r *Region) Connect(ctx context.Context, host string, port uint16) *Client 
 	return client
 }
 
-// CompareGeneric is the same thing as Compare but for interface{}.
-func GenericCompare(a, b interface{}) int {
-	return bytes.Compare(a.([]byte), b.([]byte))
+func (r *Region) Find(key []byte) *Region {
+	r.lock.RLock()
+
+	if r.splitKey == nil {
+		// this is a leaf node
+		r.lock.RUnlock()
+		return r
+	}
+
+	if bytes.Compare(key, r.splitKey) < 0 {
+		left := r.left
+		r.lock.RUnlock()
+		return left.Find(key)
+	} else {
+		right := r.right
+		r.lock.RUnlock()
+		return right.Find(key)
+	}
 }
 
-// Compare compares two region names.
-// We can't just use bytes.Compare() because it doesn't play nicely
-// with the way META keys are built as the first region has an empty start
-// key.  Let's assume we know about those 2 regions in our cache:
-//   .META.,,1
-//   tableA,,1273018455182
-// We're given an RPC to execute on "tableA", row "\x00" (1 byte row key
-// containing a 0).  If we use Compare() to sort the entries in the cache,
-// when we search for the entry right before "tableA,\000,:"
-// we'll erroneously find ".META.,,1" instead of the entry for first
-// region of "tableA".
-//
-// Since this scheme breaks natural ordering, we need this comparator to
-// implement a special version of comparison to handle this scenario.
-func Compare(a, b []byte) int {
-	var length int
-	if la, lb := len(a), len(b); la < lb {
-		length = la
+func max(a, b int) int {
+	if a > b {
+		return a
 	} else {
-		length = lb
+		return b
 	}
-	// Reminder: region names are of the form:
-	//   table_name,start_key,timestamp[.MD5.]
-	// First compare the table names.
-	var i int
-	for i = 0; i < length; i++ {
-		ai := a[i]    // Saves one pointer deference every iteration.
-		bi := b[i]    // Saves one pointer deference every iteration.
-		if ai != bi { // The name of the tables differ.
-			if ai == ',' {
-				return -1001 // `a' has a smaller table name.  a < b
-			} else if bi == ',' {
-				return 1001 // `b' has a smaller table name.  a > b
-			}
-			return int(ai) - int(bi)
-		}
-		if ai == ',' { // Remember: at this point ai == bi.
-			break // We're done comparing the table names.  They're equal.
-		}
-	}
-
-	// Now find the last comma in both `a' and `b'.  We need to start the
-	// search from the end as the row key could have an arbitrary number of
-	// commas and we don't know its length.
-	aComma := findCommaFromEnd(a, i)
-	bComma := findCommaFromEnd(b, i)
-	// If either `a' or `b' is followed immediately by another comma, then
-	// they are the first region (it's the empty start key).
-	i++ // No need to check against `length', there MUST be more bytes.
-
-	// Compare keys.
-	var firstComma int
-	if aComma < bComma {
-		firstComma = aComma
-	} else {
-		firstComma = bComma
-	}
-	for ; i < firstComma; i++ {
-		ai := a[i]
-		bi := b[i]
-		if ai != bi { // The keys differ.
-			return int(ai) - int(bi)
-		}
-	}
-	if aComma < bComma {
-		return -1002 // `a' has a shorter key.  a < b
-	} else if bComma < aComma {
-		return 1002 // `b' has a shorter key.  a > b
-	}
-
-	// Keys have the same length and have compared identical.  Compare the
-	// rest, which essentially means: use start code as a tie breaker.
-	for ; /*nothing*/ i < length; i++ {
-		ai := a[i]
-		bi := b[i]
-		if ai != bi { // The start codes differ.
-			return int(ai) - int(bi)
-		}
-	}
-
-	return len(a) - len(b)
 }
 
-// Because there is no `LastIndexByte()' in the standard `bytes' package.
-func findCommaFromEnd(b []byte, offset int) int {
-	for i := len(b) - 1; i > offset; i-- {
-		if b[i] == ',' {
-			return i
-		}
+func lock(regions... *Region) {
+	for _, region := range regions {
+		region.lock.Lock()
 	}
-	panic(fmt.Errorf("No comma found in %q after offset %d", b, offset))
+}
+
+func unlock(regions... *Region) {
+	for _, region := range regions {
+		region.lock.Unlock()
+	}
+}
+
+func rLock(regions... *Region) {
+	for _, region := range regions {
+		region.lock.RLock()
+	}
+}
+
+func rUnlock(regions... *Region) {
+	for _, region := range regions {
+		region.lock.RUnlock()
+	}
+}
+
+// left-left case:
+//         z                                z
+//        / \                             /   \
+//       y   T4   Right Rotate (z)       x      y
+//      / \       - - - - - - - ->     /  \    /  \
+//     x   T3                         T1  T2  T3  T4
+//    / \
+//  T1   T2
+
+// left-right case:
+//       z                               z
+//      / \                             /  \
+//     y   T4    Right Rotate(z)      x      y
+//    / \        - - - - - - - ->    / \    / \
+//  T1   x                          T1  T2 T3  T4
+//      / \
+//    T2   T3
+func (z *Region) rotateRight() {
+	// no need to lock z since it's locked in `rebalance`
+	t4 := z.right
+	y := z.left
+	y.lock.Lock()
+	var x, t1, t2, t3 *Region
+	if y.leftHeight > y.rightHeight { // left-left case
+		x = y.left
+		t1 = x.left
+		t2 = x.right
+		t3 = y.right
+	} else { // left-right case
+		x = y.right
+		t1 = y.left
+		t2 = x.left
+		t3 = x.right
+	}
+	x.lock.Lock()
+
+	rLock(t1, t2)
+	combine(x, t1, t2)
+	rUnlock(t2, t1)
+	rLock(t3, t4)
+	combine(y, t3, t4)
+	rUnlock(t4, t3)
+	combine(z, x, y)
+	unlock(x, y)
+}
+
+// right-right case:
+//    z                                z
+//   /  \                            /   \
+//  T1   y     Left Rotate(z)       x      y
+//      /  \   - - - - - - - ->    / \    / \
+//     T2   x                     T1  T2 T3  T4
+//         / \
+//       T3  T4
+
+// right-left case:
+//     z                             z
+//    / \                           /  \
+//  T1   y     Left Rotate(z)     x      y
+//      / \    - - - - - - ->    / \    / \
+//     x   T4                  T1  T2  T3  T4
+//    / \
+//  T2   T3
+func (z *Region) rotateLeft() {
+	// no need to lock z since it's locked in `rebalance`
+	t1 := z.left
+	y := z.right
+	y.lock.Lock()
+	var x, t2, t3, t4 *Region
+	if y.leftHeight > y.rightHeight { // right-left case
+		x = y.left
+		t2 = x.left
+		t3 = x.right
+		t4 = y.right
+	} else { // right-right case
+		x = y.right
+		t2 = y.left
+		t3 = x.left
+		t4 = x.right
+	}
+	x.lock.Lock()
+
+	rLock(t1, t2)
+	combine(x, t1, t2)
+	rUnlock(t2, t1)
+	rLock(t3, t4)
+	combine(y, t3, t4)
+	rUnlock(t4, t3)
+	combine(z, x, y)
+	unlock(x, y)
+}
+
+// given three regions, a, b, c, combine them to
+//       a
+//      / \
+//     b   c
+// b and c should be neighbours(i.e. b.stopKey == c.startKey)
+func combine(a, b, c *Region)  {
+	a.left = b
+	a.right = c
+	a.startKey = b.startKey
+	a.stopKey = c.stopKey
+	a.splitKey = c.startKey
+	a.leftHeight = a.left.height()
+	a.rightHeight = a.right.height()
+
+	b.parent = a
+	c.parent = a
+}
+
+// Rebalance the tree upwards from this region node
+func (r *Region) rebalance() {
+	r.lock.Lock()
+
+	r.left.lock.RLock()
+	r.leftHeight = r.left.height()
+	r.left.lock.RUnlock()
+	r.right.lock.RLock()
+	r.rightHeight = r.right.height()
+	r.right.lock.RUnlock()
+
+	if r.leftHeight - r.rightHeight > 1 {
+		r.rotateRight()
+	} else if r.rightHeight - r.leftHeight > 1 {
+		r.rotateLeft()
+	}
+
+	parent := r.parent
+	r.lock.Unlock()
+	if parent != nil {
+		parent.rebalance()
+	}
+}
+
+// Need RLock around
+func (r *Region) height() int {
+	return max(r.leftHeight, r.rightHeight) + 1
+}
+
+// Split current region node with fetched region info from HBase
+func (r *Region) Split(fetched *Region) {
+	r.lock.Lock()
+
+	var splits []*Region
+	if bytes.Compare(r.startKey, fetched.startKey) < 0 {
+		l := NewRegion(r.table, nil, r.startKey, fetched.startKey)
+		splits = append(splits, l)
+	}
+	splits = append(splits, fetched)
+	if bytes.Compare(r.stopKey, fetched.stopKey) > 0 ||
+		// []byte("") is the smallest for bytes.Compare, but it means +inf
+		// for stop keys
+		(len(r.stopKey) == 0 && len(fetched.stopKey) != 0) {
+		r := NewRegion(r.table, nil, fetched.stopKey, r.stopKey)
+		splits = append(splits, r)
+	}
+
+	r.client = nil
+	if len(splits) == 2 {
+		// region splits into 2 regions
+		combine(r, splits[0], splits[1])
+	} else {
+		// region splits into 3 regions, 1 on left, 2 on right
+		right := NewRegion(r.table, nil, splits[1].startKey, splits[2].stopKey)
+		combine(right, splits[1], splits[2])
+		combine(r, splits[0], right)
+	}
+
+	parent := r.parent
+	r.lock.Unlock()
+	if parent != nil {
+		parent.rebalance()
+	}
 }
