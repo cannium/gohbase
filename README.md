@@ -2,7 +2,11 @@
 
 This is a pure-[Go](http://golang.org/) client for [HBase](http://hbase.org).
 
-Forked from [tsuna/gohbase](https://github.com/tsuna/gohbase) and core logic rewritten.
+**Forked from [tsuna/gohbase](https://github.com/tsuna/gohbase) and rewrite core logic:**
+
+- Support configure HBase znode parent
+- ​Replace B+ tree with balanced binary tree for maintaining region information in memory
+- Remove some unnecessary ansychronous procedures
 
 ## Supported Versions
 

@@ -19,23 +19,23 @@ import (
 )
 
 type Region struct {
-	table         []byte
+	table []byte
 	// The attributes above are supposed to be immutable.
 
 	lock          sync.RWMutex
 	name          []byte
 	startKey      []byte
 	stopKey       []byte
-	splitKey      []byte  // the key to determine left and right
+	splitKey      []byte // the key to determine left and right
 	client        *Client
 	availableLock sync.Mutex
 
 	// Region is organized in a balanced binary tree
-	left          *Region
-	right         *Region
-	parent        *Region
-	leftHeight    int // height of left child
-	rightHeight   int // height of right child
+	left        *Region
+	right       *Region
+	parent      *Region
+	leftHeight  int // height of left child
+	rightHeight int // height of right child
 }
 
 // NewInfo creates a new region info
@@ -45,9 +45,9 @@ func NewRegion(table, name, startKey, stopKey []byte) *Region {
 		name:     name,
 		startKey: startKey,
 		stopKey:  stopKey,
-		// define height of leaf node child to be -1 so height of
+		// define height of leaf node's children to be -1 so height of
 		// a node would always be max(leftHeight + rightHeight) + 1
-		leftHeight: -1,
+		leftHeight:  -1,
 		rightHeight: -1,
 	}
 }
@@ -248,25 +248,25 @@ func max(a, b int) int {
 	}
 }
 
-func lock(regions... *Region) {
+func lock(regions ...*Region) {
 	for _, region := range regions {
 		region.lock.Lock()
 	}
 }
 
-func unlock(regions... *Region) {
+func unlock(regions ...*Region) {
 	for _, region := range regions {
 		region.lock.Unlock()
 	}
 }
 
-func rLock(regions... *Region) {
+func rLock(regions ...*Region) {
 	for _, region := range regions {
 		region.lock.RLock()
 	}
 }
 
-func rUnlock(regions... *Region) {
+func rUnlock(regions ...*Region) {
 	for _, region := range regions {
 		region.lock.RUnlock()
 	}
@@ -369,7 +369,7 @@ func (z *Region) rotateLeft() {
 //      / \
 //     b   c
 // b and c should be neighbours(i.e. b.stopKey == c.startKey)
-func combine(a, b, c *Region)  {
+func combine(a, b, c *Region) {
 	a.left = b
 	a.right = c
 	a.startKey = b.startKey
@@ -393,9 +393,9 @@ func (r *Region) rebalance() {
 	r.rightHeight = r.right.height()
 	r.right.lock.RUnlock()
 
-	if r.leftHeight - r.rightHeight > 1 {
+	if r.leftHeight-r.rightHeight > 1 {
 		r.rotateRight()
-	} else if r.rightHeight - r.leftHeight > 1 {
+	} else if r.rightHeight-r.leftHeight > 1 {
 		r.rotateLeft()
 	}
 

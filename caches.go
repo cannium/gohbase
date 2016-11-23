@@ -75,9 +75,9 @@ type regionCache struct {
 
 func newRegionCache() *regionCache {
 	return &regionCache{
-		lock:       new(sync.Mutex),
-		regions:    make(map[string]*region.Region),
-		clients:    newClientCache(),
+		lock:    new(sync.Mutex),
+		regions: make(map[string]*region.Region),
+		clients: newClientCache(),
 	}
 }
 
@@ -161,4 +161,3 @@ func rangeEqual(A, B *region.Region) bool {
 	return bytes.Equal(A.StartKey(), B.StartKey()) &&
 		bytes.Equal(A.StopKey(), B.StopKey())
 }
-
