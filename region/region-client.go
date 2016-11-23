@@ -318,7 +318,6 @@ func (c *Client) receive() error {
 		err = proto.UnmarshalMerge(buf, rpcResp)
 	} else {
 		javaClass := *resp.Exception.ExceptionClassName
-		fmt.Println("HBase Exception: ", javaClass)
 		err = fmt.Errorf("HBase Java exception %s: \n%s", javaClass, *resp.Exception.StackTrace)
 		if _, ok := javaRetryableExceptions[javaClass]; ok {
 			// This is a recoverable error. The client should retry.
