@@ -207,7 +207,7 @@ func (c *client) Scan(s *hrpc.Scan) ([]*hrpc.Result, error) {
 	for {
 		remainingRetries--
 		result, err := c.scan(s)
-		if remainingRetries == 0 {
+		if remainingRetries <= 0 {
 			return result, err
 		}
 

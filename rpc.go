@@ -84,7 +84,7 @@ func (c *client) sendRPC(rpc hrpc.RpcCall) (proto.Message, *region.Region, error
 			return nil, nil, ErrDeadline
 		}
 
-		if remainingRetries == 0 {
+		if remainingRetries <= 0 {
 			return result.Msg, r, result.Error
 		}
 		// Check for errors
