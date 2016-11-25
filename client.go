@@ -118,8 +118,7 @@ func (c *client) Close() {
 	c.regions.close()
 }
 
-// Scan retrieves the values specified in families from the given range.
-func (c *client) Scan(s *hrpc.Scan) ([]*hrpc.Result, error) {
+func (c *client) scan(s *hrpc.Scan) ([]*hrpc.Result, error) {
 	var results []*pb.Result
 	var scanResp *pb.ScanResponse
 	ctx := s.Context()
@@ -196,6 +195,27 @@ func (c *client) Scan(s *hrpc.Scan) ([]*hrpc.Result, error) {
 			return localResults, nil
 		} else {
 			startRow = reg.StopKey()
+		}
+	}
+}
+
+// Scan retrieves the values specified in families from the given range.
+func (c *client) Scan(s *hrpc.Scan) ([]*hrpc.Result, error) {
+	remainingRetries := 3
+	// Since region split may happen after scan is initialized,
+	// we should be able to retry the whole scan operation
+	for {
+		remainingRetries--
+		result, err := c.scan(s)
+		if remainingRetries == 0 {
+			return result, err
+		}
+
+		switch err.(type) {
+		case region.RetryableError:
+			continue
+		default:
+			return result, err
 		}
 	}
 }

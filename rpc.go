@@ -59,14 +59,22 @@ func (c *client) findDestinationRegion(rpc hrpc.RpcCall) (*region.Region, error)
 }
 
 func (c *client) sendRPC(rpc hrpc.RpcCall) (proto.Message, *region.Region, error) {
+	remainingRetries := 10
 	for {
+		remainingRetries--
 		r, err := c.findDestinationRegion(rpc)
 		if err != nil {
 			return nil, nil, err
 		}
 
 		rpc.SetRegionName(r.Name())
-		r.Client().QueueRPC(rpc)
+		client := r.Client()
+		if client == nil {
+			// it's possible that the region is marked unavailable before
+			// we get its client
+			continue
+		}
+		client.QueueRPC(rpc)
 
 		// Wait for the response
 		var result hrpc.RpcResult
@@ -76,6 +84,9 @@ func (c *client) sendRPC(rpc hrpc.RpcCall) (proto.Message, *region.Region, error
 			return nil, nil, ErrDeadline
 		}
 
+		if remainingRetries == 0 {
+			return result.Msg, r, result.Error
+		}
 		// Check for errors
 		switch result.Error.(type) {
 		case region.RetryableError:

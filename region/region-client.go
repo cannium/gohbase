@@ -46,6 +46,7 @@ var (
 		"org.apache.hadoop.hbase.exceptions.RegionMovedException":           struct{}{},
 		"org.apache.hadoop.hbase.exceptions.RegionOpeningException":         struct{}{},
 		"org.apache.hadoop.hbase.regionserver.RegionServerStoppedException": struct{}{},
+		"org.apache.hadoop.hbase.UnknownScannerException":                   struct{}{},
 	}
 
 	// queue size of region client
