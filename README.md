@@ -16,7 +16,7 @@ go >= 1.7
 
 ## Installation
 
-    go get github.com/tsuna/gohbase
+    go get github.com/cannium/gohbase
 
 ## Example Usage
 
