@@ -254,6 +254,7 @@ func (c *Client) sendBatch(rpcs []*call) {
 		default:
 			err := c.send(rpc)
 			if _, ok := err.(UnrecoverableError); ok {
+				c.ClientDown()
 				c.fail(err)
 				return
 			}
