@@ -172,7 +172,7 @@ func (c *client) scan(s *hrpc.Scan) ([]*hrpc.Result, error) {
 
 		rpc = hrpc.NewCloseFromID(ctx, table, *scanResp.ScannerId, rpc.Key())
 
-		result, reg, err = c.sendRPC(rpc)
+		c.sendRPC(rpc)
 		// Note: this error is deliberately ignored, as in java and other clients,
 		// (TODO) but they handle partial results and heartbeat message
 
