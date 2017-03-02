@@ -156,8 +156,11 @@ func (c *client) scan(s *hrpc.Scan) ([]*hrpc.Result, error) {
 		results = append(results, scanResp.Results...)
 		receivedRows += uint32(len(scanResp.Results))
 
-		for scanResp.GetMoreResultsInRegion() ||
-			(len(scanResp.Results) > 0 && scanResp.GetMoreResults()) {
+		for scanResp.GetMoreResultsInRegion() && len(scanResp.Results) > 0 {
+
+			if numberOfRows != 0 && receivedRows >= numberOfRows {
+				break
+			}
 
 			rpc = hrpc.NewScanFromID(ctx, table, *scanResp.ScannerId, rpc.Key())
 
